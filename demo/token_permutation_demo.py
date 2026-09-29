@@ -265,32 +265,79 @@ def verify_safetensors(root: Path, expected_count: int) -> None:
         fail(f"safe_open exposed {opened} tensors in {root}, expected {expected_count}")
 
 
+UNSAFE_LOADING_KEYS = {
+    "_attn_implementation",
+    "_attn_implementation_internal",
+    "attn_implementation",
+    "attn_implementation_internal",
+    "kernels",
+    "kernel",
+    "use_kernels",
+}
+
+
+def _reject_unsafe_loading_fields(value: Any, path: str = "config") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in UNSAFE_LOADING_KEYS or key.startswith("_attn_"):
+                fail(f"unsafe model loading field {path}.{key}")
+            _reject_unsafe_loading_fields(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_unsafe_loading_fields(child, f"{path}[{index}]")
+
+
+def load_local_llama_config(root: Path) -> dict[str, Any]:
+    value = load_json(root / "config.json")
+    if not isinstance(value, dict) or value.get("model_type") != "llama":
+        fail("local model config must be a Llama configuration")
+    _reject_unsafe_loading_fields(value)
+    return value
+
+
+def load_local_llama_model(root: Path, model_class: Any, torch_module: Any) -> tuple[Any, dict[str, Any]]:
+    config_data = load_local_llama_config(root)
+    config_class = getattr(model_class, "config_class", None)
+    if config_class is None or not hasattr(config_class, "from_dict"):
+        fail("Llama model class does not expose a safe config constructor")
+    config = config_class.from_dict(config_data)
+    model, info = model_class.from_pretrained(
+        str(root),
+        config=config,
+        local_files_only=True,
+        trust_remote_code=False,
+        use_safetensors=True,
+        output_loading_info=True,
+        dtype=torch_module.float32,
+        attn_implementation="eager",
+    )
+    missing = set(info.get("missing_keys", []))
+    allowed_missing = {"lm_head.weight"} if model.config.tie_word_embeddings else set()
+    if (
+        missing - allowed_missing
+        or info.get("unexpected_keys")
+        or info.get("mismatched_keys")
+        or info.get("error_msgs")
+    ):
+        fail(f"unexpected local model loading report for {root}: {info}")
+    model.eval()
+    model.to("cpu")
+    return model, info
+
+
 def load_transformers_models(source: Path, obfuscated: Path) -> tuple[Any, Any, Any]:
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer, LlamaForCausalLM
     except ImportError as error:
         fail(f"install the demo dependencies before running inference: {error}")
     tokenizer = AutoTokenizer.from_pretrained(
         str(source), local_files_only=True, trust_remote_code=False, use_fast=True
     )
-    loaded = []
-    for root in (source, obfuscated):
-        model, info = AutoModelForCausalLM.from_pretrained(
-            str(root),
-            local_files_only=True,
-            trust_remote_code=False,
-            use_safetensors=True,
-            output_loading_info=True,
-            torch_dtype=torch.float32,
-        )
-        missing = set(info.get("missing_keys", []))
-        allowed_missing = {"lm_head.weight"} if model.config.tie_word_embeddings else set()
-        if missing - allowed_missing or info.get("unexpected_keys") or info.get("mismatched_keys") or info.get("error_msgs"):
-            fail(f"unexpected local model loading report for {root}: {info}")
-        model.eval()
-        model.to("cpu")
-        loaded.append(model)
+    loaded = [
+        load_local_llama_model(root, LlamaForCausalLM, torch)[0]
+        for root in (source, obfuscated)
+    ]
     if getattr(loaded[0].config, "tie_word_embeddings", False):
         if loaded[0].lm_head.weight.data_ptr() != loaded[0].model.embed_tokens.weight.data_ptr():
             fail("source tied embedding was not restored by Transformers")

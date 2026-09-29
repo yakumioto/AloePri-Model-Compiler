@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -89,6 +90,57 @@ class TokenPermutationDemoTests(unittest.TestCase):
                 {"vocab_size": 5},
                 {},
             )
+
+    def test_untrusted_attention_config_is_rejected_before_model_loader(self) -> None:
+        class FakeModel:
+            config_class = LlamaConfig
+            from_pretrained = Mock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for key in ("_attn_implementation_internal", "attn_implementation"):
+                (root / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "model_type": "llama",
+                            key: "kernels-community/unsafe",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    demo.load_local_llama_model(root, FakeModel, torch)
+            FakeModel.from_pretrained.assert_not_called()
+
+    def test_local_llama_loader_forces_eager_and_offline_flags(self) -> None:
+        config = {
+            "model_type": "llama",
+            "vocab_size": 4,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            model = SimpleNamespace(
+                config=SimpleNamespace(tie_word_embeddings=True),
+                eval=Mock(),
+                to=Mock(),
+            )
+            class FakeModel:
+                config_class = LlamaConfig
+                from_pretrained = Mock(return_value=(model, {}))
+
+            demo.load_local_llama_model(root, FakeModel, torch)
+            kwargs = FakeModel.from_pretrained.call_args.kwargs
+            self.assertEqual(kwargs["attn_implementation"], "eager")
+            self.assertTrue(kwargs["local_files_only"])
+            self.assertFalse(kwargs["trust_remote_code"])
+            self.assertTrue(kwargs["use_safetensors"])
+            self.assertIs(kwargs["dtype"], torch.float32)
 
     def test_tied_and_untied_tiny_llama_logits_and_greedy_are_equivalent(self) -> None:
         torch.set_num_threads(1)
