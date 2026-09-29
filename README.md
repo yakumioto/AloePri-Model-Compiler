@@ -10,9 +10,20 @@ The compiler discovers local `config.json` plus a single `model.safetensors` or
 an HF `model.safetensors.index.json` and its shards. It validates tensor ranges
 and metadata, fingerprints source bytes with BLAKE3, builds a streaming plan,
 writes standard safetensors output, verifies the result from disk, and publishes
-it atomically. `aloepri-token` changes vocabulary rows while preserving the
-physical tensor inventory; tied checkpoints keep the missing physical
-`lm_head.weight` alias.
+it atomically.
+
+Operation inputs and outputs are decoupled, so a method is no longer assumed to
+produce the same tensor names, shapes, dtypes or byte lengths that it consumed.
+Layout, headers, offsets and shard assignment are planned from the output
+descriptors. `identity` preserves bytes exactly; `aloepri-token` permutes
+vocabulary rows while keeping the tensor topology; tied checkpoints keep the
+missing physical `lm_head.weight` alias.
+
+Every artifact declares a runtime contract. Identity and token outputs remain
+standard Hugging Face checkpoints (`standard_hf_checkpoint = true`). A
+non-standard artifact declares `standard_hf_checkpoint = false` and is reported
+as requiring its own runtime: `aloepri verify` never presents it as loadable by
+vanilla Transformers, and it performs structural verification only.
 
 The compiler does not download models, implement Attention/FFN/RoPE transforms,
 quantization, hidden-state obfuscation, or claim cryptographic weight secrecy.
@@ -71,6 +82,13 @@ aloepri verify MODEL
 new external `--secret-output` path. A resumed token transform reads and
 validates the existing Secret and never generates a replacement.
 
+`aloepri verify` prints a layered report: structure, manifest, v3 plan
+verification, the declared `standard_hf_checkpoint` flag, `runtime_required`,
+and `semantic_verification: not_run`. A non-standard artifact verifies
+structurally and is reported as requiring its runtime; it is never described as
+vanilla-HF loadable. An artifact with no manifest is container-only, with
+runtime compatibility reported as unknown.
+
 `--memory-limit` applies to the compiler-managed metadata and I/O working set;
 it is not an operating-system RSS cap. A tensor is never split across output
 shards. A tensor larger than `--max-shard-size` is placed in an oversize shard
@@ -79,6 +97,11 @@ and copied in chunks.
 Transform writes a versioned manifest and checkpoint into a private staging
 directory, verifies the candidate from disk, and publishes it with a Linux
 `renameat2(RENAME_NOREPLACE)` operation. Existing output is never overwritten.
+Resume refuses any checkpoint whose source fingerprint, method, runtime
+contract, layout, plan hash or secret does not match the current plan, before
+staging is touched. Manifest, checkpoint and plan are schema version 3; legacy
+v1/v2 artifacts remain readable for structural verification only and are never
+resumed or upgraded.
 
 ## Token permutation demo
 

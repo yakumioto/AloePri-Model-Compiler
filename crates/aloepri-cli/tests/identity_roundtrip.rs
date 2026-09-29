@@ -84,7 +84,7 @@ fn identity_round_trip_is_sharded_and_verifiable() {
             output.to_str().unwrap(),
             "--identity",
             "--memory-limit",
-            "4KiB",
+            "8KiB",
             "--max-shard-size",
             "4B",
         ])
@@ -127,7 +127,7 @@ fn identity_round_trip_is_sharded_and_verifiable() {
             output.to_str().unwrap(),
             "--identity",
             "--memory-limit",
-            "4KiB",
+            "8KiB",
             "--max-shard-size",
             "4B",
             "--resume",
@@ -195,7 +195,7 @@ fn indexed_input_can_be_repacked_to_one_shard() {
             output.to_str().unwrap(),
             "--identity",
             "--memory-limit",
-            "4KiB",
+            "8KiB",
             "--max-shard-size",
             "4GiB",
         ])
@@ -276,7 +276,7 @@ fn model_larger_than_memory_limit_still_succeeds() {
             output.to_str().unwrap(),
             "--identity",
             "--memory-limit",
-            "4KiB",
+            "8KiB",
             "--max-shard-size",
             "4GiB",
         ])

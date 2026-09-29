@@ -1,7 +1,7 @@
 use aloepri_core::{
     error::{CompilerError, Result},
     executor::{StreamingExecutor, TransformExecutor},
-    io::{OutputWriter, TensorReader},
+    io::{TensorReader, TensorSink, copy_bytes},
     memory::MemoryBudget,
     model::ModelArtifact,
     plan::{MethodContract, Operation, OperationKind, SecretBinding, TokenRole, TransformConfig},
@@ -82,16 +82,19 @@ impl TransformExecutor for TokenPermutationExecutor {
         &self,
         artifact: &dyn ModelArtifact,
         operation: &Operation,
-        writer: &mut dyn OutputWriter,
+        sink: &mut dyn TensorSink,
         budget: &MemoryBudget,
-    ) -> Result<ModelFingerprint> {
+    ) -> Result<()> {
         match operation.kind {
             OperationKind::Copy => self
                 .copy
-                .execute_operation(artifact, operation, writer, budget),
+                .execute_operation(artifact, operation, sink, budget),
             OperationKind::TokenPermutation { role } => {
-                self.execute_permutation(artifact, operation, role, writer, budget)
+                self.execute_permutation(artifact, operation, role, sink, budget)
             }
+            OperationKind::PadColumns { .. } => Err(CompilerError::Unsupported(
+                "aloepri-token does not implement column padding".into(),
+            )),
         }
     }
 }
@@ -101,24 +104,25 @@ impl TokenPermutationExecutor {
         &self,
         artifact: &dyn ModelArtifact,
         operation: &Operation,
-        _role: TokenRole,
-        writer: &mut dyn OutputWriter,
+        role: TokenRole,
+        sink: &mut dyn TensorSink,
         budget: &MemoryBudget,
-    ) -> Result<ModelFingerprint> {
-        let row_bytes = row_bytes(&operation.source.shape, operation.source.dtype)?;
-        let vocab_size = operation
-            .source
+    ) -> Result<()> {
+        let source_descriptor = &operation.inputs[0].descriptor;
+        let name = &source_descriptor.name;
+        let row_bytes = row_bytes(&source_descriptor.shape, source_descriptor.dtype)?;
+        let vocab_size = source_descriptor
             .shape
             .as_slice()
             .first()
             .copied()
             .ok_or_else(|| CompilerError::InvalidTensor {
-                name: operation.tensor.to_string(),
+                name: name.to_string(),
                 reason: "token tensor must have a vocabulary dimension".into(),
             })?;
         if vocab_size != self.binding.vocab_size {
             return Err(CompilerError::InvalidTensor {
-                name: operation.tensor.to_string(),
+                name: name.to_string(),
                 reason: "token tensor vocabulary does not match the client secret".into(),
             });
         }
@@ -128,9 +132,9 @@ impl TokenPermutationExecutor {
                 .ok_or(CompilerError::ArithmeticOverflow {
                     operation: "token tensor byte length",
                 })?;
-        if expected_length != operation.source.byte_length.0 {
+        if expected_length != source_descriptor.byte_length.0 {
             return Err(CompilerError::InvalidTensor {
-                name: operation.tensor.to_string(),
+                name: name.to_string(),
                 reason: "token tensor byte length does not match its shape".into(),
             });
         }
@@ -142,24 +146,38 @@ impl TokenPermutationExecutor {
                     operation: "token permutation memory reservation",
                 })?;
         let mapping_reservation = budget.reserve(mapping_bytes)?;
-        let mut source_for_hash = artifact.tensor_reader(&operation.tensor)?;
+        let mut source_for_hash = artifact.tensor_reader(name)?;
         let source_digest =
-            fingerprint_reader(source_for_hash.as_mut(), operation.source.byte_length)?;
-        let source = artifact.tensor_reader(&operation.tensor)?;
+            fingerprint_reader(source_for_hash.as_mut(), source_descriptor.byte_length)?;
+        let source = artifact.tensor_reader(name)?;
         let mut reader = PermutedTensorReader::new(
             source,
             self.inverse_permutation.clone(),
             row_bytes,
-            operation.source.byte_length,
+            source_descriptor.byte_length,
         )?;
-        let output_digest = writer.write_tensor(&operation.source, &mut reader, budget)?;
+        // The executor hashes what it emits so it can prove the embedding
+        // really changed; the authoritative completion digest still comes from
+        // the sink, which the compiler finishes.
+        let mut emitted = blake3::Hasher::new();
+        let mut write = |bytes: &[u8]| {
+            emitted.update(bytes);
+            sink.write_bytes(bytes)
+        };
+        copy_bytes(
+            &mut reader,
+            &mut write,
+            operation.output.descriptor.byte_length,
+            budget,
+        )?;
+        let output_digest = ModelFingerprint::from_digest(emitted.finalize());
         drop(mapping_reservation);
-        if matches!(_role, TokenRole::InputEmbedding) && output_digest == source_digest {
+        if matches!(role, TokenRole::InputEmbedding) && output_digest == source_digest {
             return Err(CompilerError::InvalidPlan {
                 reason: "token permutation did not change embedding bytes".into(),
             });
         }
-        Ok(output_digest)
+        Ok(())
     }
 }
 

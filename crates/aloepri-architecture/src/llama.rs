@@ -1,10 +1,38 @@
 use aloepri_core::{
     error::{CompilerError, Result},
     model::{ArchitectureAdapter, ModelArtifact},
-    plan::{Operation, OperationKind, PlanDraft, TokenRole, TransformConfig},
-    types::{ByteLength, ByteOffset, DType, OutputDType, TensorName},
+    plan::{
+        Operation, OperationInput, OperationKind, OperationOutput, PlanDraft, RuntimeContract,
+        TokenRole, TransformConfig,
+    },
+    types::{ByteLength, ByteOffset, DType, TensorName},
 };
 use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// Logical dimensions the runtime contract records, in the order the Llama
+/// config schema defines them. `num_key_value_heads` and `head_dim` may be
+/// absent when their documented fallbacks apply.
+const DIMENSION_KEYS: &[&str] = &[
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "intermediate_size",
+    "vocab_size",
+    "head_dim",
+];
+
+fn logical_dimensions(artifact: &dyn ModelArtifact) -> BTreeMap<String, u64> {
+    let config = artifact.config();
+    let mut dimensions = BTreeMap::new();
+    for key in DIMENSION_KEYS {
+        if let Some(value) = optional_u64(config, key) {
+            dimensions.insert((*key).to_owned(), value);
+        }
+    }
+    dimensions
+}
 
 pub struct LlamaDenseAdapter;
 
@@ -216,17 +244,21 @@ impl ArchitectureAdapter for LlamaDenseAdapter {
                 };
                 Operation {
                     id: aloepri_core::types::OperationId(index as u32),
-                    tensor: tensor.name.clone(),
-                    source: tensor.clone(),
-                    output_dtype: OutputDType::Preserve,
+                    kind,
+                    inputs: vec![OperationInput {
+                        descriptor: tensor.clone(),
+                    }],
+                    output: OperationOutput {
+                        descriptor: tensor.into(),
+                    },
                     memory_requirement: ByteLength(bounded_chunk(tensor.byte_length.0)),
                     dependencies: Vec::new(),
-                    kind,
                 }
             })
             .collect();
         Ok(PlanDraft {
             architecture: "llama".into(),
+            runtime_contract: RuntimeContract::huggingface("llama", logical_dimensions(artifact)),
             operations,
         })
     }

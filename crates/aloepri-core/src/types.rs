@@ -232,8 +232,56 @@ impl TensorDescriptor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// The shape of a tensor an operation produces.
+///
+/// It deliberately carries no source location: an output has no place in the
+/// input artifact, and its physical placement is decided by the output layout.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutputTensorDescriptor {
+    pub name: TensorName,
+    pub shape: TensorShape,
+    pub dtype: DType,
+    pub byte_length: ByteLength,
+}
+
+impl OutputTensorDescriptor {
+    pub fn expected_byte_length(&self) -> Result<ByteLength, CompilerError> {
+        let elements = self.shape.element_count()?;
+        let bytes = elements.checked_mul(self.dtype.byte_width()).ok_or(
+            CompilerError::ArithmeticOverflow {
+                operation: "tensor byte length",
+            },
+        )?;
+        Ok(ByteLength(bytes))
+    }
+}
+
+impl From<&TensorDescriptor> for OutputTensorDescriptor {
+    fn from(descriptor: &TensorDescriptor) -> Self {
+        Self {
+            name: descriptor.name.clone(),
+            shape: descriptor.shape.clone(),
+            dtype: descriptor.dtype,
+            byte_length: descriptor.byte_length,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelFingerprint([u8; 32]);
+
+impl Serialize for ModelFingerprint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelFingerprint {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::from_hex(&value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl ModelFingerprint {
     pub fn from_digest(digest: blake3::Hash) -> Self {

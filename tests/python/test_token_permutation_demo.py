@@ -91,6 +91,54 @@ class TokenPermutationDemoTests(unittest.TestCase):
                 {},
             )
 
+    def test_v3_binding_requires_a_standard_runtime_before_loading(self) -> None:
+        secret = make_secret()
+        config = {"vocab_size": 4}
+        plan = {
+            "method": {"id": "aloepri-token", "version": "0.1"},
+            "plan_hash": "ab" * 32,
+            "source_fingerprint": secret["source_fingerprint"],
+        }
+        standard = {
+            "artifact_version": 3,
+            "method": {"id": "aloepri-token", "version": "0.1"},
+            "secret_id": secret["secret_id"],
+            "source_fingerprint": secret["source_fingerprint"],
+            "plan_hash": plan["plan_hash"],
+            "standard_hf_checkpoint": True,
+            "runtime_contract": {
+                "id": "huggingface",
+                "version": "1",
+                "standard_hf_checkpoint": True,
+            },
+            "plan": plan,
+        }
+        demo.validate_artifact_binding(secret, config, config, standard)
+
+        # A version-3 artifact that is not a standard HF checkpoint must be
+        # refused before the Transformers loader is ever called.
+        non_standard = dict(standard)
+        non_standard["standard_hf_checkpoint"] = False
+        non_standard["runtime_contract"] = {
+            "id": "expand-test-runtime",
+            "version": "0.1",
+            "standard_hf_checkpoint": False,
+        }
+        with self.assertRaises(ValueError):
+            demo.validate_artifact_binding(secret, config, config, non_standard)
+
+        # Likewise a version-3 manifest with a mismatched embedded plan.
+        mismatched = dict(standard)
+        mismatched["plan"] = {**plan, "plan_hash": "cd" * 32}
+        with self.assertRaises(ValueError):
+            demo.validate_artifact_binding(secret, config, config, mismatched)
+
+        # Unsupported versions are not silently accepted.
+        with self.assertRaises(ValueError):
+            demo.validate_artifact_binding(
+                secret, config, config, {**standard, "artifact_version": 4}
+            )
+
     def test_untrusted_attention_config_is_rejected_before_model_loader(self) -> None:
         class FakeModel:
             config_class = LlamaConfig

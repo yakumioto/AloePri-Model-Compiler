@@ -131,7 +131,7 @@ fn interrupted_sharded_staging_resumes_to_the_clean_result() {
         path(&clean),
         "--identity",
         "--memory-limit",
-        "4KiB",
+        "8KiB",
         "--max-shard-size",
         "4B",
     ]);
@@ -151,7 +151,7 @@ fn interrupted_sharded_staging_resumes_to_the_clean_result() {
     let work = directory.path().join(".resumed.aloepri-work");
     let candidate = work.join("artifact");
     fs::create_dir_all(&candidate).unwrap();
-    let plan = build_plan(&source, 4 * 1024, 4);
+    let plan = build_plan(&source, 8 * 1024, 4);
     assert!(plan.output_layout.shards.len() > 1, "fixture must shard");
     let writer = StreamingWriter::create(&candidate, plan.output_layout.clone()).unwrap();
     drop(writer);
@@ -177,7 +177,7 @@ fn interrupted_sharded_staging_resumes_to_the_clean_result() {
         path(&resumed),
         "--identity",
         "--memory-limit",
-        "4KiB",
+        "8KiB",
         "--max-shard-size",
         "4B",
         "--resume",
@@ -209,7 +209,7 @@ fn rejected_resume_leaves_staging_untouched_and_the_proper_resume_succeeds() {
         path(&clean),
         "--identity",
         "--memory-limit",
-        "4KiB",
+        "8KiB",
         "--max-shard-size",
         "4B",
     ]);
@@ -222,7 +222,7 @@ fn rejected_resume_leaves_staging_untouched_and_the_proper_resume_succeeds() {
     let work = directory.path().join(".resumed.aloepri-work");
     let candidate = work.join("artifact");
     fs::create_dir_all(&candidate).unwrap();
-    let plan = build_plan(&source, 4 * 1024, 4);
+    let plan = build_plan(&source, 8 * 1024, 4);
     drop(StreamingWriter::create(&candidate, plan.output_layout.clone()).unwrap());
     aloepri_core::backend::ArtifactBackend::store_checkpoint(
         &HfBackend,
@@ -242,7 +242,7 @@ fn rejected_resume_leaves_staging_untouched_and_the_proper_resume_succeeds() {
         path(&resumed),
         "--identity",
         "--memory-limit",
-        "4KiB",
+        "8KiB",
         "--max-shard-size",
         "16B",
         "--resume",
@@ -266,7 +266,7 @@ fn rejected_resume_leaves_staging_untouched_and_the_proper_resume_succeeds() {
         path(&resumed),
         "--identity",
         "--memory-limit",
-        "4KiB",
+        "8KiB",
         "--max-shard-size",
         "4B",
         "--resume",

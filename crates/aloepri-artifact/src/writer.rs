@@ -1,9 +1,8 @@
 use aloepri_core::{
     error::{CompilerError, Result, io_error},
-    io::{OutputWriter, TensorReader, TensorWriter, copy_tensor},
-    memory::MemoryBudget,
+    io::{OutputWriter, TensorSink, TensorWriter},
     plan::OutputLayout,
-    types::{ByteLength, ModelFingerprint, TensorDescriptor, TensorName},
+    types::{ByteLength, ModelFingerprint, OutputTensorDescriptor, TensorName},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -171,59 +170,50 @@ impl StreamingWriter {
 }
 
 impl TensorWriter for StreamingWriter {
-    fn write_tensor(
+    fn begin_tensor(
         &mut self,
-        descriptor: &TensorDescriptor,
-        reader: &mut dyn TensorReader,
-        budget: &MemoryBudget,
-    ) -> Result<ModelFingerprint> {
-        let output =
+        output: &OutputTensorDescriptor,
+    ) -> Result<Box<dyn TensorSink + '_>> {
+        let planned =
             self.layout
-                .tensor(&descriptor.name)
+                .tensor(&output.name)
                 .ok_or_else(|| CompilerError::MissingTensor {
-                    name: descriptor.name.to_string(),
+                    name: output.name.to_string(),
                 })?;
-        if descriptor.byte_length != output.byte_length
-            || descriptor.dtype != output.dtype
-            || descriptor.shape != output.shape
+        if planned.shape != output.shape
+            || planned.dtype != output.dtype
+            || planned.byte_length != output.byte_length
         {
             return Err(CompilerError::InvalidPlan {
-                reason: format!("output metadata differs for {}", descriptor.name),
-            });
-        }
-        if reader.len() != descriptor.byte_length {
-            return Err(CompilerError::InvalidTensor {
-                name: descriptor.name.to_string(),
-                reason: format!(
-                    "reader length {} differs from descriptor {}",
-                    reader.len().0,
-                    descriptor.byte_length.0
-                ),
+                reason: format!("output metadata differs for {}", output.name),
             });
         }
         let shard = self
             .layout
             .shards
-            .get(output.shard as usize)
+            .get(planned.shard as usize)
             .ok_or_else(|| CompilerError::Invariant("output shard missing".into()))?;
         let absolute = 8_u64
             .checked_add(shard.header.len() as u64)
-            .and_then(|value| value.checked_add(output.offset.0))
+            .and_then(|value| value.checked_add(planned.offset.0))
             .ok_or(CompilerError::ArithmeticOverflow {
                 operation: "output tensor write offset",
             })?;
+        let path = self.root.join(&shard.filename);
         let file = self
             .files
             .get_mut(&shard.id)
             .ok_or_else(|| CompilerError::Invariant("output shard file is closed".into()))?;
         file.seek(SeekFrom::Start(absolute))
-            .map_err(|source| io_error(self.root.join(&shard.filename), source))?;
-        let path = self.root.join(&shard.filename);
-        let mut append = |bytes: &[u8]| {
-            file.write_all(bytes)
-                .map_err(|source| io_error(&path, source))
-        };
-        copy_tensor(reader, &mut append, descriptor.byte_length, budget)
+            .map_err(|source| io_error(&path, source))?;
+        Ok(Box::new(ShardSink {
+            file,
+            path,
+            expected: planned.byte_length,
+            written: 0,
+            hasher: blake3::Hasher::new(),
+            failed: false,
+        }))
     }
 
     fn sync(&mut self) -> Result<()> {
@@ -232,6 +222,75 @@ impl TensorWriter for StreamingWriter {
                 .map_err(|source| io_error(self.root.join(format!("shard-{id}")), source))?;
         }
         Ok(())
+    }
+}
+
+/// A bounded sink over one output tensor's byte range.
+///
+/// It counts what was actually written, hashes exactly those bytes, and refuses
+/// to finish short. An overlong write is rejected as a whole before any byte
+/// reaches the file, so it can never spill into a neighbouring tensor.
+struct ShardSink<'a> {
+    file: &'a mut File,
+    path: PathBuf,
+    expected: ByteLength,
+    written: u64,
+    hasher: blake3::Hasher,
+    failed: bool,
+}
+
+impl TensorSink for ShardSink<'_> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.failed {
+            return Err(CompilerError::OutputCorrupted {
+                reason: format!("{}: sink is in a failed state", self.path.display()),
+            });
+        }
+        let length = u64::try_from(bytes.len()).map_err(|_| CompilerError::ArithmeticOverflow {
+            operation: "output write length",
+        })?;
+        let end = self
+            .written
+            .checked_add(length)
+            .ok_or(CompilerError::ArithmeticOverflow {
+                operation: "output write range",
+            })?;
+        if end > self.expected.0 {
+            self.failed = true;
+            return Err(CompilerError::OutputCorrupted {
+                reason: format!(
+                    "{}: write of {length} bytes would overrun the output tensor by {} bytes",
+                    self.path.display(),
+                    end - self.expected.0
+                ),
+            });
+        }
+        if let Err(source) = self.file.write_all(bytes) {
+            self.failed = true;
+            return Err(io_error(&self.path, source));
+        }
+        self.hasher.update(bytes);
+        self.written = end;
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<ModelFingerprint> {
+        if self.failed {
+            return Err(CompilerError::OutputCorrupted {
+                reason: format!("{}: sink failed before finishing", self.path.display()),
+            });
+        }
+        if self.written != self.expected.0 {
+            return Err(CompilerError::OutputCorrupted {
+                reason: format!(
+                    "{}: underwrite, wrote {} of {} bytes",
+                    self.path.display(),
+                    self.written,
+                    self.expected.0
+                ),
+            });
+        }
+        Ok(ModelFingerprint::from_digest(self.hasher.finalize()))
     }
 }
 
@@ -270,66 +329,60 @@ fn write_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aloepri_core::types::{ByteOffset, DType, ShardId, TensorLocation, TensorShape};
-    use std::io::Cursor;
+    use aloepri_core::types::{DType, TensorName, TensorShape};
     use tempfile::tempdir;
 
-    struct Reader(Cursor<Vec<u8>>);
-
-    impl TensorReader for Reader {
-        fn len(&self) -> ByteLength {
-            ByteLength(self.0.get_ref().len() as u64)
-        }
-        fn read_bytes(&mut self, offset: ByteOffset, destination: &mut [u8]) -> Result<()> {
-            self.0.set_position(offset.0);
-            self.0
-                .read_exact(destination)
-                .map_err(|source| io_error("reader", source))
+    fn descriptor(name: &str, length: u64) -> OutputTensorDescriptor {
+        OutputTensorDescriptor {
+            name: TensorName::try_from(name).unwrap(),
+            shape: TensorShape::new(vec![length]),
+            dtype: DType::U8,
+            byte_length: ByteLength(length),
         }
     }
 
-    #[test]
-    fn writer_copies_payload_without_whole_tensor_requirement() {
-        let descriptor = TensorDescriptor {
-            name: TensorName::try_from("x").unwrap(),
-            shape: TensorShape::new(vec![3]),
-            dtype: DType::U8,
-            byte_length: ByteLength(3),
-            location: TensorLocation {
-                shard: ShardId(0),
-                offset: ByteOffset(0),
-                length: ByteLength(3),
-            },
-        };
+    fn writer_with(descriptor: &OutputTensorDescriptor) -> (tempfile::TempDir, StreamingWriter) {
         let layout =
-            crate::layout::plan_output_layout(std::slice::from_ref(&descriptor), ByteLength(10))
+            crate::layout::plan_output_layout(std::slice::from_ref(descriptor), ByteLength(1024))
                 .unwrap();
         let directory = tempdir().unwrap();
-        let mut writer = StreamingWriter::create(directory.path(), layout).unwrap();
-        let hash = writer
-            .write_tensor(
-                &descriptor,
-                &mut Reader(Cursor::new(vec![1, 2, 3])),
-                &MemoryBudget::new(2),
-            )
-            .unwrap();
+        let writer = StreamingWriter::create(directory.path(), layout).unwrap();
+        (directory, writer)
+    }
+
+    #[test]
+    fn sink_writes_exact_bytes_and_reports_their_digest() {
+        let descriptor = descriptor("x", 3);
+        let (_directory, mut writer) = writer_with(&descriptor);
+        let digest = {
+            let mut sink = writer.begin_tensor(&descriptor).unwrap();
+            sink.write_bytes(&[1, 2, 3]).unwrap();
+            sink.finish().unwrap()
+        };
         writer.sync().unwrap();
-        assert_eq!(hash, writer.tensor_hash(&descriptor.name).unwrap());
+        assert_eq!(digest, writer.tensor_hash(&descriptor.name).unwrap());
+    }
+
+    #[test]
+    fn sink_rejects_underwrite_and_overwrite() {
+        let descriptor = descriptor("x", 3);
+        let (_directory, mut writer) = writer_with(&descriptor);
+        {
+            let mut sink = writer.begin_tensor(&descriptor).unwrap();
+            sink.write_bytes(&[1, 2]).unwrap();
+            assert!(sink.finish().is_err());
+        }
+        let (_directory, mut writer) = writer_with(&descriptor);
+        {
+            let mut sink = writer.begin_tensor(&descriptor).unwrap();
+            assert!(sink.write_bytes(&[1, 2, 3, 4]).is_err());
+            assert!(sink.write_bytes(&[1]).is_err());
+        }
     }
 
     #[test]
     fn resume_rejects_weight_files_outside_the_planned_layout() {
-        let descriptor = TensorDescriptor {
-            name: TensorName::try_from("x").unwrap(),
-            shape: TensorShape::new(vec![3]),
-            dtype: DType::U8,
-            byte_length: ByteLength(3),
-            location: TensorLocation {
-                shard: ShardId(0),
-                offset: ByteOffset(0),
-                length: ByteLength(3),
-            },
-        };
+        let descriptor = descriptor("x", 3);
         let layout =
             crate::layout::plan_output_layout(std::slice::from_ref(&descriptor), ByteLength(3))
                 .unwrap();

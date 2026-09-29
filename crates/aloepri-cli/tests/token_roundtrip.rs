@@ -131,9 +131,11 @@ fn token_transform_changes_only_vocab_rows_and_verifies() {
 
     let manifest: Value =
         serde_json::from_slice(&fs::read(output.join("aloepri.json")).unwrap()).unwrap();
-    assert_eq!(manifest["artifact_version"], 2);
+    assert_eq!(manifest["artifact_version"], 3);
     assert_eq!(manifest["method"]["id"], "aloepri-token");
     assert_eq!(manifest["secret_id"], secret_json["secret_id"]);
+    assert_eq!(manifest["standard_hf_checkpoint"], true);
+    assert_eq!(manifest["runtime_contract"]["id"], "huggingface");
     assert!(manifest.get("token_permutation").is_none());
     assert!(manifest.get("binding_nonce").is_none());
 
@@ -217,6 +219,71 @@ fn token_transform_permutates_an_untied_output_projection() {
             &output_head[obfuscated * 8..(obfuscated + 1) * 8]
         );
     }
+}
+
+#[test]
+fn a_different_valid_secret_cannot_resume_another_secret_artifact() {
+    use aloepri_artifact::HfArtifact;
+    use aloepri_core::ModelArtifact;
+
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source");
+    let output = directory.path().join("output");
+    let first_secret = directory.path().join("first-secret.json");
+    let second_secret = directory.path().join("second-secret.json");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("config.json"), CONFIG).unwrap();
+    write_safetensors(&source.join("model.safetensors"), &tensors());
+
+    let fingerprint = HfArtifact::open(&source).unwrap().fingerprint().unwrap();
+
+    let transform = Command::new(env!("CARGO_BIN_EXE_aloepri"))
+        .args([
+            "transform",
+            source.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--method",
+            "aloepri-token",
+            "--secret-output",
+            first_secret.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        transform.status.success(),
+        "{}",
+        String::from_utf8_lossy(&transform.stderr)
+    );
+
+    // A second secret that is valid on its own terms — same source and
+    // vocabulary, different binding nonce and permutation — must still be
+    // refused because its commitment is not the one the artifact was built
+    // with. The refusal must come from the binding, not a parse failure.
+    let second =
+        aloepri_secret::ClientSecret::from_components(fingerprint, 3, [2; 32], vec![2, 0, 1])
+            .unwrap();
+    second.validate().unwrap();
+    second.write_new(&second_secret).unwrap();
+
+    let resume = Command::new(env!("CARGO_BIN_EXE_aloepri"))
+        .args([
+            "transform",
+            source.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--method",
+            "aloepri-token",
+            "--secret-output",
+            second_secret.to_str().unwrap(),
+            "--resume",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !resume.status.success(),
+        "a different valid secret must not resume another secret's artifact"
+    );
 }
 
 #[test]

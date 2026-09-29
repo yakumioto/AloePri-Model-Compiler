@@ -15,11 +15,12 @@ pub use backend::{
 pub use compiler::Compiler;
 pub use error::{CompilerError, Result};
 pub use executor::{StreamingExecutor, TransformExecutor};
-pub use io::{OutputWriter, TensorReader, TensorWriter};
+pub use io::{OutputWriter, TensorReader, TensorSink, TensorWriter};
 pub use memory::{MemoryBudget, MemoryReservation};
 pub use model::{ArchitectureAdapter, ArchitectureRegistry, ModelArtifact, ModelSpec};
 pub use plan::{
-    MethodContract, Operation, OperationKind, OutputLayout, OutputShard, OutputTensor, PlanDraft,
-    SecretBinding, TokenRole, TransformConfig, TransformPlan,
+    MethodContract, Operation, OperationInput, OperationKind, OperationOutput, OutputLayout,
+    OutputShard, OutputTensor, PlanDraft, RuntimeContract, SCHEMA_VERSION, SecretBinding,
+    TokenRole, TransformConfig, TransformPlan,
 };
 pub use types::*;

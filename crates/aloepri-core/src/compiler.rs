@@ -8,6 +8,7 @@ use crate::{
     memory::MemoryBudget,
     model::{ArchitectureRegistry, ModelArtifact},
     plan::{TransformConfig, TransformPlan},
+    types::{OperationId, OutputTensorDescriptor},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -144,12 +145,21 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
             if completed.contains_key(&operation.id) {
                 continue;
             }
-            let digest = self.executor.execute_operation(
-                artifact.as_ref(),
-                operation,
-                writer.as_mut(),
-                &budget,
-            )?;
+            let output = &operation.output.descriptor;
+            // The compiler owns the sink lifecycle: the executor writes into a
+            // bounded borrow, the compiler finishes and syncs, and only then is
+            // the operation recorded. A failed or short write can never record
+            // completion.
+            let digest = {
+                let mut sink = writer.begin_tensor(output)?;
+                self.executor.execute_operation(
+                    artifact.as_ref(),
+                    operation,
+                    sink.as_mut(),
+                    &budget,
+                )?;
+                sink.finish()?
+            };
             writer.sync()?;
             completed.insert(operation.id, digest.to_string());
             self.backend
@@ -179,7 +189,15 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
         let adapter = self.registry.detect(artifact)?;
         let draft = adapter.build_plan(artifact, config)?;
         let fingerprint = artifact.fingerprint()?;
-        let layout = self.backend.plan_output(artifact, config)?;
+        // The layout is planned from the outputs the adapter declared, before
+        // any file exists: no later step may reshape a planned shard.
+        let outputs: Vec<OutputTensorDescriptor> = draft
+            .operations
+            .iter()
+            .map(|operation| operation.output.descriptor.clone())
+            .collect();
+        let layout = self.backend.plan_output(&outputs, config)?;
+        self.backend.validate_output_layout(&layout)?;
         TransformPlan::from_draft(
             draft,
             fingerprint,
@@ -197,8 +215,14 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
     ) -> TransformReport {
         TransformReport {
             plan_hash: plan.plan_hash.to_string(),
-            tensor_count: plan.operations.len(),
+            tensor_count: plan.output_inventory.len(),
+            source_tensor_count: plan.source_inventory.len(),
             payload_bytes: plan
+                .output_inventory
+                .iter()
+                .map(|tensor| tensor.byte_length.0)
+                .sum(),
+            source_payload_bytes: plan
                 .source_inventory
                 .iter()
                 .map(|tensor| tensor.byte_length.0)
@@ -221,7 +245,7 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
     fn validate_completed(
         &self,
         plan: &TransformPlan,
-        completed: &BTreeMap<crate::types::OperationId, String>,
+        completed: &BTreeMap<OperationId, String>,
         writer: &mut dyn crate::io::OutputWriter,
     ) -> Result<()> {
         let mut expected = BTreeSet::new();
@@ -233,13 +257,11 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
                         reason: "completed operations are not a contiguous prefix".into(),
                     });
                 }
-                let actual = writer.hash_tensor(&operation.tensor)?.to_string();
+                let name = &operation.output.descriptor.name;
+                let actual = writer.hash_tensor(name)?.to_string();
                 if actual != *digest {
                     return Err(CompilerError::ResumeMismatch {
-                        reason: format!(
-                            "completed tensor {} does not match the checkpoint",
-                            operation.tensor
-                        ),
+                        reason: format!("completed tensor {name} does not match the checkpoint"),
                     });
                 }
             } else {
