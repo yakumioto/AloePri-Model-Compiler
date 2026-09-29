@@ -21,6 +21,20 @@ impl MethodContract {
             version: "0.1".into(),
         }
     }
+
+    pub fn aloepri_token() -> Self {
+        Self {
+            id: "aloepri-token".into(),
+            version: "0.1".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SecretBinding {
+    pub secret_id: String,
+    pub source_fingerprint: ModelFingerprint,
+    pub vocab_size: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -30,6 +44,8 @@ pub struct TransformConfig {
     pub memory_limit: ByteLength,
     pub max_shard_size: ByteLength,
     pub workers: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_binding: Option<SecretBinding>,
 }
 
 impl Default for TransformConfig {
@@ -40,6 +56,7 @@ impl Default for TransformConfig {
             memory_limit: ByteLength(256 * 1024 * 1024),
             max_shard_size: ByteLength(4 * 1024 * 1024 * 1024),
             workers: 1,
+            secret_binding: None,
         }
     }
 }
@@ -50,6 +67,27 @@ pub struct PlanDraft {
     pub operations: Vec<Operation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TokenRole {
+    InputEmbedding,
+    OutputProjection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OperationKind {
+    #[default]
+    #[serde(rename = "copy")]
+    Copy,
+    #[serde(rename = "token_permutation")]
+    TokenPermutation { role: TokenRole },
+}
+
+impl OperationKind {
+    pub fn is_copy(&self) -> bool {
+        matches!(self, Self::Copy)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Operation {
     pub id: OperationId,
@@ -58,6 +96,8 @@ pub struct Operation {
     pub output_dtype: OutputDType,
     pub memory_requirement: ByteLength,
     pub dependencies: Vec<OperationId>,
+    #[serde(default, skip_serializing_if = "OperationKind::is_copy")]
+    pub kind: OperationKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -105,6 +145,8 @@ pub struct TransformPlan {
     pub source_fingerprint: ModelFingerprint,
     pub source_inventory: Vec<TensorDescriptor>,
     pub method: MethodContract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
     pub architecture: String,
     pub operations: Vec<Operation>,
     pub output_layout: OutputLayout,
@@ -127,19 +169,78 @@ impl TransformPlan {
         }
         if config.output_dtype != OutputDType::Preserve {
             return Err(CompilerError::Unsupported(
-                "identity only supports Preserve output dtype".into(),
+                "the supported methods preserve the source dtype".into(),
             ));
         }
-        if config.method != MethodContract::identity() {
-            return Err(CompilerError::Unsupported(
-                "only the identity method is implemented".into(),
-            ));
+        let is_identity = config.method == MethodContract::identity();
+        let is_token = config.method == MethodContract::aloepri_token();
+        if !is_identity && !is_token {
+            return Err(CompilerError::Unsupported(format!(
+                "unsupported method {}/{}",
+                config.method.id, config.method.version
+            )));
         }
-        let metadata_bytes = (source_inventory.len() as u64).checked_mul(256).ok_or(
+        let secret_id = if is_token {
+            let binding =
+                config
+                    .secret_binding
+                    .as_ref()
+                    .ok_or_else(|| CompilerError::InvalidPlan {
+                        reason: "aloepri-token requires a client secret binding".into(),
+                    })?;
+            if binding.source_fingerprint != source_fingerprint {
+                return Err(CompilerError::InvalidPlan {
+                    reason: "client secret source fingerprint does not match the input".into(),
+                });
+            }
+            if binding.vocab_size < 2 {
+                return Err(CompilerError::InvalidPlan {
+                    reason: "client secret vocabulary must contain at least two tokens".into(),
+                });
+            }
+            Some(binding.secret_id.clone())
+        } else {
+            if config.secret_binding.is_some() {
+                return Err(CompilerError::InvalidPlan {
+                    reason: "identity does not accept a client secret binding".into(),
+                });
+            }
+            None
+        };
+        if is_identity
+            && draft
+                .operations
+                .iter()
+                .any(|operation| !operation.kind.is_copy())
+        {
+            return Err(CompilerError::InvalidPlan {
+                reason: "identity operations must be byte copies".into(),
+            });
+        }
+        let base_metadata = (source_inventory.len() as u64).checked_mul(256).ok_or(
             CompilerError::ArithmeticOverflow {
                 operation: "plan metadata estimate",
             },
         )?;
+        let mapping_bytes = config
+            .secret_binding
+            .as_ref()
+            .map(|binding| {
+                binding
+                    .vocab_size
+                    .checked_mul(8)
+                    .ok_or(CompilerError::ArithmeticOverflow {
+                        operation: "token permutation memory estimate",
+                    })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let metadata_bytes =
+            base_metadata
+                .checked_add(mapping_bytes)
+                .ok_or(CompilerError::ArithmeticOverflow {
+                    operation: "plan metadata estimate",
+                })?;
         if config.memory_limit.0 <= metadata_bytes {
             return Err(CompilerError::MemoryLimitExceeded {
                 requested: metadata_bytes.saturating_add(1),
@@ -148,10 +249,11 @@ impl TransformPlan {
         }
         let io_buffer_bytes = (config.memory_limit.0 - metadata_bytes).min(4 * 1024 * 1024);
         let mut plan = Self {
-            version: 1,
+            version: if is_token { 2 } else { 1 },
             source_fingerprint,
             source_inventory,
             method: config.method.clone(),
+            secret_id,
             architecture: draft.architecture,
             operations: draft.operations,
             output_layout,
@@ -168,9 +270,17 @@ impl TransformPlan {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1 {
+        let identity = self.method == MethodContract::identity();
+        let token = self.method == MethodContract::aloepri_token();
+        if (!identity && !token) || (identity && self.version != 1) || (token && self.version != 2)
+        {
             return Err(CompilerError::UnsupportedVersion {
                 version: self.version,
+            });
+        }
+        if (identity && self.secret_id.is_some()) || (token && self.secret_id.is_none()) {
+            return Err(CompilerError::InvalidPlan {
+                reason: "method and secret binding metadata do not agree".into(),
             });
         }
         let source_names: BTreeSet<_> = self
@@ -332,6 +442,7 @@ mod tests {
                 output_dtype: OutputDType::Preserve,
                 memory_requirement: ByteLength(1),
                 dependencies: vec![],
+                kind: OperationKind::Copy,
             }],
         };
         let first = TransformPlan::from_draft(

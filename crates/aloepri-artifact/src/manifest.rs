@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
 pub const MANIFEST_VERSION: u32 = 1;
+pub const TOKEN_MANIFEST_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TensorManifest {
@@ -30,6 +31,8 @@ pub struct Manifest {
     pub tensors: Vec<TensorManifest>,
     pub standard_hf_checkpoint: bool,
     pub secret_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
 }
 
 impl Manifest {
@@ -40,7 +43,7 @@ impl Manifest {
         tensors: Vec<TensorManifest>,
     ) -> Self {
         Self {
-            artifact_version: MANIFEST_VERSION,
+            artifact_version: plan.version,
             method: plan.method.clone(),
             architecture: plan.architecture.clone(),
             source_fingerprint: plan.source_fingerprint.to_string(),
@@ -51,6 +54,7 @@ impl Manifest {
             tensors,
             standard_hf_checkpoint: true,
             secret_key_id: None,
+            secret_id: plan.secret_id.clone(),
         }
     }
 
@@ -73,11 +77,35 @@ impl Manifest {
         })?;
         let manifest: Self =
             serde_json::from_slice(&bytes).map_err(|source| json_error(&path, source))?;
-        if manifest.artifact_version != MANIFEST_VERSION {
+        if !matches!(
+            manifest.artifact_version,
+            MANIFEST_VERSION | TOKEN_MANIFEST_VERSION
+        ) {
             return Err(CompilerError::UnsupportedVersion {
                 version: manifest.artifact_version,
             });
         }
+        let identity = manifest.method == MethodContract::identity();
+        let token = manifest.method == MethodContract::aloepri_token();
+        let token_secret_valid = manifest.secret_id.as_deref().is_some_and(valid_secret_id);
+        if (!identity && !token)
+            || (manifest.artifact_version == MANIFEST_VERSION
+                && (!identity || manifest.secret_id.is_some()))
+            || (manifest.artifact_version == TOKEN_MANIFEST_VERSION
+                && (!token || !token_secret_valid))
+        {
+            return Err(CompilerError::InvalidArtifact {
+                path,
+                reason: "manifest method, version, and secret metadata disagree".into(),
+            });
+        }
         Ok(manifest)
     }
+}
+
+fn valid_secret_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }

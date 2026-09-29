@@ -145,7 +145,10 @@ impl ArtifactBackend for HfBackend {
 
     fn output_matches_plan(&self, output: &Path, plan: &TransformPlan) -> bool {
         Manifest::read(output).is_ok_and(|manifest| {
-            manifest.source_fingerprint == plan.source_fingerprint.to_string()
+            manifest.artifact_version == plan.version
+                && manifest.method == plan.method
+                && manifest.secret_id == plan.secret_id
+                && manifest.source_fingerprint == plan.source_fingerprint.to_string()
                 && manifest.plan_hash == plan.plan_hash.to_string()
         })
     }

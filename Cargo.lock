@@ -65,6 +65,10 @@ name = "aloepri-secret"
 version = "0.1.0"
 dependencies = [
  "aloepri-core",
+ "blake3",
+ "getrandom",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -72,6 +76,7 @@ name = "aloepri-transform"
 version = "0.1.0"
 dependencies = [
  "aloepri-core",
+ "blake3",
 ]
 
 [[package]]

@@ -8,3 +8,7 @@ authors.workspace = true
 
 [dependencies]
 aloepri-core.workspace = true
+blake3.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -13,16 +13,16 @@ aloepri-cli -> aloepri-artifact -> aloepri-core
 managed memory budget, and the generic streaming executor. `aloepri-artifact`
 owns HF discovery, safetensors headers, bounded readers, fingerprints, output
 layout, writer, checkpoint, manifest, atomic publishing, and verification.
-`aloepri-architecture` contains the Llama dense adapter only. The adapter
-validates configuration and tensor schema but never performs numerical work.
-`aloepri-transform` owns Identity execution and knows neither model names nor
-architecture-specific naming rules. `aloepri-secret` records the explicit
-v0.1 boundary and never emits a key or seed.
+`aloepri-architecture` contains the Llama dense adapter. `aloepri-transform`
+owns Identity copying and token row-permutation execution without knowing
+architecture-specific tensor discovery. `aloepri-secret` owns Client Secret v1
+schema, OS-random permutation generation, commitment validation, and external
+file persistence.
 
 ## Compiler façade and injection contract
 
-`aloepri-core::Compiler<B, R, E>` is constructed from three injected
-implementations and exposes the four v0.1 APIs:
+`aloepri_core::Compiler<B, R, E>` is constructed from three injected
+implementations and exposes:
 
 ```rust
 Compiler::new(backend, registry, executor)
@@ -32,45 +32,44 @@ Compiler::new(backend, registry, executor)
     .verify(&Path)                        -> VerificationOutcome
 ```
 
-- `B: ArtifactBackend` carries every artifact-format capability: `open`,
-  `plan_output`, `staging_has_output`, `create_writer`, `resume_writer`,
-  `prepare_staging`, `load_checkpoint`, `store_checkpoint`, `finalize`,
-  `output_matches_plan`, `publish`, `lock_output`, `verify`. `HfBackend` in
-  `aloepri-artifact` is the v0.1 implementation. Keeping these behind the trait
-  is what prevents a `core <-> artifact` dependency cycle.
-- `R: ArchitectureRegistry` detects and selects the adapter; the Llama dense
-  adapter is the only registered one.
-- `E: TransformExecutor` performs one operation. `StreamingExecutor` in core is
-  method-agnostic; `IdentityExecutor` in `aloepri-transform` enforces the
-  identity contract and delegates the mechanical copy.
+The compiler owns ordering, staging, checkpointing, publication, and disk
+verification. The architecture adapter creates a plan whose operations are
+marked `Copy` or `TokenPermutation` with an abstract vocabulary role. The token
+executor receives an already validated inverse permutation and wraps the
+existing `TensorReader`; it never materializes a whole tensor or writes a
+second pipeline. The artifact writer continues to validate shape, dtype, and
+length and streams each transformed tensor through the same output layout.
 
-The compiler orders operations, decides where to stage, persists checkpoints,
-publishes atomically and validates resume state. The executor receives only the
-final plan and injected reader/writer interfaces, runs one operation at a time
-and never materializes a whole tensor.
+## Tied vocabulary weights
 
-The compiler creates a semantic `PlanDraft`, then combines it with source
-fingerprint and artifact output layout to produce a validated `TransformPlan`.
+The adapter validates the complete dense Llama schema. For tied models where
+only `model.embed_tokens.weight` is physical, the plan transforms that tensor
+only and preserves the logical `lm_head.weight` alias. If both tied tensors are
+physical, their metadata and bytes must match before both receive the same row
+mapping. Token mode rejects unsupported output bias and non-floating
+vocabulary dtypes; Identity retains its original passthrough behavior.
 
-## Resume detection
+## Secret and publication lifecycle
 
-Interruption leaves shard files in staging even though the index is written
-only after every operation, so the resume path is chosen from what staging
-already holds (`ArtifactBackend::staging_has_output`) rather than from a
-single-file name.
+The CLI opens the source and computes its fingerprint before generating a
+Client Secret. A fresh token run exclusively creates and syncs the selected
+external Secret file, then invokes the same `Compiler::transform` pipeline.
+Resume reads and validates that file and never regenerates it. The compiler
+stores only the public `secret_id` in plan, checkpoint, and manifest; the
+permutations and nonce remain in the external Secret and process memory.
+Secret persistence and model publication are separate paths: the guarantee is
+that a visible new model cannot appear before the requested Secret is synced,
+not a cross-path transaction.
 
-The compiler validates the checkpoint contract immediately after planning,
-before it creates the staging directory, takes the lock or opens a writer. A
-resume whose parameters do not match the interrupted run is rejected with no
-filesystem side effects, so a mistyped flag cannot strand an interrupted run or
-leave stray shards behind. A resumed run then re-validates every existing shard
-header and length, re-hashes the checkpointed prefix, refuses a mismatch, and
-rejects weight files that are not part of the planned layout.
+## Resume detection and memory
 
-## Memory limit
+Interruption leaves shard files in staging even though the index is written only
+after every operation, so resume is chosen from what staging holds. The
+compiler validates the checkpoint contract—including method and `secret_id`—
+before creating the staging directory, taking the lock, or opening a writer.
+Token plan metadata accounts for the vocabulary mapping in its managed memory
+estimate; row reads and writes remain bounded by the existing budget.
 
-The memory limit is a contract for compiler-managed metadata, I/O buffers,
-headers, and scratch state. Runtime and allocator overhead and the OS page
-cache are outside that number; the project does not claim a hard RSS limit.
-`scripts/large_model_smoke.py` measures the Rust process peak RSS across
-payload sizes to show it does not scale with the model.
+The memory limit covers compiler-managed metadata, I/O buffers, headers, and
+scratch state. Runtime and allocator overhead and the OS page cache are
+outside that number; the project does not claim a hard RSS limit.

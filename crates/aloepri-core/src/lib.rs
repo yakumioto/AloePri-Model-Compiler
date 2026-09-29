@@ -19,7 +19,7 @@ pub use io::{OutputWriter, TensorReader, TensorWriter};
 pub use memory::{MemoryBudget, MemoryReservation};
 pub use model::{ArchitectureAdapter, ArchitectureRegistry, ModelArtifact, ModelSpec};
 pub use plan::{
-    MethodContract, Operation, OutputLayout, OutputShard, OutputTensor, PlanDraft, TransformConfig,
-    TransformPlan,
+    MethodContract, Operation, OperationKind, OutputLayout, OutputShard, OutputTensor, PlanDraft,
+    SecretBinding, TokenRole, TransformConfig, TransformPlan,
 };
 pub use types::*;

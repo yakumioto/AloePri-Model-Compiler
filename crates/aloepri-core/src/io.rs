@@ -34,7 +34,8 @@ pub fn copy_tensor(
     length: ByteLength,
     budget: &MemoryBudget,
 ) -> Result<ModelFingerprint> {
-    if length.0 > 0 && budget.limit() == 0 {
+    let available = budget.available();
+    if length.0 > 0 && available == 0 {
         return Err(CompilerError::MemoryLimitExceeded {
             requested: 1,
             available: 0,
@@ -43,7 +44,7 @@ pub fn copy_tensor(
     let chunk_size = if length.0 == 0 {
         1
     } else {
-        length.0.min(4 * 1024 * 1024).min(budget.limit())
+        length.0.min(4 * 1024 * 1024).min(available)
     };
     let reservation = budget.reserve(chunk_size)?;
     let mut buffer = vec![0_u8; chunk_size as usize];

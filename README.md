@@ -1,18 +1,23 @@
 # AloePri Model Compiler
 
-A local Rust compiler for identity-preserving Hugging Face safetensors artifacts.
+A local Rust compiler for Hugging Face safetensors artifacts. The compiler
+supports the byte-preserving `identity` method and the first weight-changing
+`aloepri-token` vocabulary permutation for dense Llama checkpoints.
 
-## v0.1 scope
+## Scope
 
-v0.1 discovers local `config.json` plus a single `model.safetensors` or an HF
-`model.safetensors.index.json` and its shards. It validates tensor ranges and
-metadata, fingerprints source bytes with BLAKE3, builds a deterministic identity
-plan, copies payloads in bounded chunks, writes standard safetensors output, and
-verifies the result from disk. The first architecture adapter is the tested
-Llama dense/GQA schema used by SmolLM-compatible checkpoints.
+The compiler discovers local `config.json` plus a single `model.safetensors` or
+an HF `model.safetensors.index.json` and its shards. It validates tensor ranges
+and metadata, fingerprints source bytes with BLAKE3, builds a streaming plan,
+writes standard safetensors output, verifies the result from disk, and publishes
+it atomically. `aloepri-token` changes vocabulary rows while preserving the
+physical tensor inventory; tied checkpoints keep the missing physical
+`lm_head.weight` alias.
 
-The compiler does not download models, run inference, or implement AloePri
-math, Client Secrets, KDFs, quantization, or non-Identity transforms.
+The compiler does not download models, implement Attention/FFN/RoPE transforms,
+quantization, hidden-state obfuscation, or claim cryptographic weight secrecy.
+The Client Secret is an external file and must be supplied to the client-side
+inference demo.
 
 ## Build and test
 
@@ -56,8 +61,15 @@ aloepri inspect MODEL
 aloepri plan MODEL --identity --memory-limit 32MiB --max-shard-size 32MiB
 aloepri transform MODEL --output OUTPUT --identity \
   --memory-limit 32MiB --max-shard-size 32MiB [--resume]
+aloepri transform MODEL --output OUTPUT --method aloepri-token \
+  --secret-output ./client-secret.json \
+  --memory-limit 32MiB --max-shard-size 32MiB [--resume]
 aloepri verify MODEL
 ```
+
+`--method identity` is equivalent to `--identity`; the token method requires a
+new external `--secret-output` path. A resumed token transform reads and
+validates the existing Secret and never generates a replacement.
 
 `--memory-limit` applies to the compiler-managed metadata and I/O working set;
 it is not an operating-system RSS cap. A tensor is never split across output
@@ -67,5 +79,23 @@ and copied in chunks.
 Transform writes a versioned manifest and checkpoint into a private staging
 directory, verifies the candidate from disk, and publishes it with a Linux
 `renameat2(RENAME_NOREPLACE)` operation. Existing output is never overwritten.
+
+## Token permutation demo
+
+Install the pinned demo dependencies from `demo/requirements.txt`, prepare a
+local Hugging Face SmolLM2-135M checkout, run the Rust transform, then execute:
+
+```bash
+HF_HUB_OFFLINE=1 python demo/token_permutation_demo.py \
+  --source ./SmolLM2-135M \
+  --obfuscated ./SmolLM2-135M-aloepri \
+  --secret ./client-secret.json \
+  --prompt 'Once upon a time' \
+  --max-new-tokens 16
+```
+
+The demo independently checks the Secret commitment, source/output tensor
+relationships, tied embedding loading, teacher-forced logits, and restored
+greedy token IDs before printing `Baseline`, `AloePri`, and `Equivalent: true`.
 See `docs/architecture.md`, `docs/artifact-format.md`, and
-`docs/method-contract.md` for the stable v0.1 boundaries.
+`docs/method-contract.md` for the stable contracts.
