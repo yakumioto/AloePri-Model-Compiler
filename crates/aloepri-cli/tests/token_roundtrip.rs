@@ -219,6 +219,73 @@ fn token_transform_permutates_an_untied_output_projection() {
     }
 }
 
+#[test]
+fn token_transform_accepts_bare_dot_and_absolute_secret_paths() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("config.json"), CONFIG).unwrap();
+    write_safetensors(&source.join("model.safetensors"), &tensors());
+
+    let cases = [
+        ("client-secret.json", "bare-output"),
+        ("./dot-secret.json", "dot-output"),
+    ];
+    for (secret_argument, output_name) in cases {
+        let output = directory.path().join(output_name);
+        let result = Command::new(env!("CARGO_BIN_EXE_aloepri"))
+            .current_dir(directory.path())
+            .args([
+                "transform",
+                source.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--method",
+                "aloepri-token",
+                "--secret-output",
+                secret_argument,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "secret path {secret_argument}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(output.join("aloepri.json").is_file());
+        assert!(
+            directory
+                .path()
+                .join(secret_argument.trim_start_matches("./"))
+                .is_file()
+        );
+    }
+
+    let absolute_secret = directory.path().join("absolute-secret.json");
+    let absolute_output = directory.path().join("absolute-output");
+    let result = Command::new(env!("CARGO_BIN_EXE_aloepri"))
+        .current_dir(directory.path())
+        .args([
+            "transform",
+            source.to_str().unwrap(),
+            "--output",
+            absolute_output.to_str().unwrap(),
+            "--method",
+            "aloepri-token",
+            "--secret-output",
+            absolute_secret.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "absolute secret path: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(absolute_output.join("aloepri.json").is_file());
+    assert!(absolute_secret.is_file());
+}
+
 fn write_safetensors(path: &Path, tensors: &[Fixture]) {
     let mut offset = 0_u64;
     let mut header = serde_json::Map::new();

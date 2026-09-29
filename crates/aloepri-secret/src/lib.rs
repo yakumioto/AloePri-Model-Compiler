@@ -133,12 +133,14 @@ impl ClientSecret {
         file.write_all(&bytes)
             .map_err(|source| io_error(path, source))?;
         file.sync_all().map_err(|source| io_error(path, source))?;
-        if let Some(parent) = path.parent() {
-            let directory = File::open(parent).map_err(|source| io_error(parent, source))?;
-            directory
-                .sync_all()
-                .map_err(|source| io_error(parent, source))?;
-        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = File::open(parent).map_err(|source| io_error(parent, source))?;
+        directory
+            .sync_all()
+            .map_err(|source| io_error(parent, source))?;
         Ok(())
     }
 

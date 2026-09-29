@@ -30,15 +30,38 @@ SECRET_KEYS = {
 }
 
 
+class DuplicateJsonKey(ValueError):
+    pass
+
+
+def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKey(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
 def fail(message: str) -> NoReturn:
     raise ValueError(message)
 
 
+def parse_json(data: str | bytes, label: str) -> Any:
+    try:
+        return json.loads(data, object_pairs_hook=reject_duplicate_pairs)
+    except DuplicateJsonKey as error:
+        fail(f"duplicate JSON key in {label}: {error}")
+    except json.JSONDecodeError as error:
+        fail(f"invalid JSON in {label}: {error}")
+
+
 def load_json(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        data = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
         fail(f"cannot read JSON {path}: {error}")
+    return parse_json(data, str(path))
 
 
 def hex_bytes(value: Any, label: str) -> bytes:
@@ -314,23 +337,49 @@ def greedy(model: Any, input_ids: Any, attention_mask: Any, permutation: list[in
     return sequence
 
 
-def run(args: argparse.Namespace) -> bool:
-    secret = load_secret(args.secret)
-    source_config, source_tensors = read_artifact(args.source)
-    obfuscated_config, obfuscated_tensors = read_artifact(args.obfuscated)
-    source_config_value = json.loads(source_config)
-    obfuscated_config_value = json.loads(obfuscated_config)
+def validate_artifact_binding(
+    secret: dict[str, Any],
+    source_config: dict[str, Any],
+    obfuscated_config: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
     if source_config != obfuscated_config:
-        fail("source and obfuscated config.json bytes differ")
-    if source_config_value.get("vocab_size") != secret["vocab_size"] or obfuscated_config_value.get("vocab_size") != secret["vocab_size"]:
+        fail("source and obfuscated config.json values differ")
+    if (
+        source_config.get("vocab_size") != secret["vocab_size"]
+        or obfuscated_config.get("vocab_size") != secret["vocab_size"]
+    ):
         fail("client secret vocab_size does not match model config")
-    manifest = load_json(args.obfuscated / "aloepri.json")
-    if manifest.get("artifact_version") != 2 or manifest.get("method") != {"id": "aloepri-token", "version": "0.1"}:
+    if manifest.get("artifact_version") != 2 or manifest.get("method") != {
+        "id": "aloepri-token",
+        "version": "0.1",
+    }:
         fail("obfuscated artifact is not an aloepri-token manifest")
     if manifest.get("secret_id") != secret["secret_id"]:
         fail("manifest secret_id does not match client secret")
     if manifest.get("source_fingerprint") != secret["source_fingerprint"]:
         fail("manifest source fingerprint does not match client secret")
+
+
+def run(args: argparse.Namespace) -> bool:
+    secret = load_secret(args.secret)
+    source_config, source_tensors = read_artifact(args.source)
+    obfuscated_config, obfuscated_tensors = read_artifact(args.obfuscated)
+    source_config_value = parse_json(source_config, str(args.source / "config.json"))
+    obfuscated_config_value = parse_json(obfuscated_config, str(args.obfuscated / "config.json"))
+    manifest = load_json(args.obfuscated / "aloepri.json")
+    if source_config != obfuscated_config:
+        fail("source and obfuscated config.json bytes differ")
+    if not isinstance(source_config_value, dict) or not isinstance(obfuscated_config_value, dict):
+        fail("model config.json must contain objects")
+    if not isinstance(manifest, dict):
+        fail("obfuscated manifest must contain an object")
+    validate_artifact_binding(
+        secret,
+        source_config_value,
+        obfuscated_config_value,
+        manifest,
+    )
     if artifact_fingerprint(args.source, source_config, source_tensors) != secret["source_fingerprint"]:
         fail("client secret source fingerprint does not match source artifact")
     verify_weight_relationship(source_tensors, obfuscated_tensors, secret["token_permutation"])
