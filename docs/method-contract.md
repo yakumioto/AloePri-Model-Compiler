@@ -19,6 +19,14 @@ source and plan, validates output headers and lengths, re-hashes completed
 ranges, and rejects a mismatch. Each completed operation is synced before its
 checkpoint is atomically replaced.
 
+A resume validates the checkpoint contract against the recomputed plan *before*
+the staging directory, the output lock or any writer is created. A resume whose
+parameters do not match the interrupted run is therefore rejected without
+creating, resizing or removing a single file, and the original parameters can
+still finish the run. Staging is resumed whenever it already holds safetensors
+output, and the resumed writer rejects weight files that are not part of the
+planned layout, so a plan-external file can never be published.
+
 The candidate artifact is verified from disk before publication. Publication
 uses a fixed lock file and Linux `renameat2(RENAME_NOREPLACE)` on the same
 filesystem; an existing output is an error. A failed run leaves its owned

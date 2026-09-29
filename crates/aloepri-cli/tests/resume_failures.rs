@@ -189,6 +189,133 @@ fn interrupted_sharded_staging_resumes_to_the_clean_result() {
     assert_eq!(report["verification"]["manifest_verified"], true);
 }
 
+#[test]
+fn rejected_resume_leaves_staging_untouched_and_the_proper_resume_succeeds() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source");
+    let clean = directory.path().join("clean");
+    let resumed = directory.path().join("resumed");
+    prepare_sharded_input(&source);
+
+    let clean_run = run(&[
+        "transform",
+        path(&source),
+        "--output",
+        path(&clean),
+        "--identity",
+        "--memory-limit",
+        "4KiB",
+        "--max-shard-size",
+        "4B",
+    ]);
+    assert!(
+        clean_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean_run.stderr)
+    );
+
+    let work = directory.path().join(".resumed.aloepri-work");
+    let candidate = work.join("artifact");
+    fs::create_dir_all(&candidate).unwrap();
+    let plan = build_plan(&source, 4 * 1024, 4);
+    drop(StreamingWriter::create(&candidate, plan.output_layout.clone()).unwrap());
+    aloepri_core::backend::ArtifactBackend::store_checkpoint(
+        &HfBackend,
+        &work.join("checkpoint.json"),
+        &plan,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let before = staging_files(&work);
+
+    // A mismatched layout (16 bytes per shard rather than 4) must be rejected
+    // without creating, resizing or removing anything in the staging directory.
+    let rejected = run(&[
+        "transform",
+        path(&source),
+        "--output",
+        path(&resumed),
+        "--identity",
+        "--memory-limit",
+        "4KiB",
+        "--max-shard-size",
+        "16B",
+        "--resume",
+    ]);
+    assert!(
+        !rejected.status.success(),
+        "a mismatched resume must be rejected"
+    );
+    assert_eq!(
+        staging_files(&work),
+        before,
+        "a rejected resume must not touch the staging directory"
+    );
+    assert!(!resumed.exists());
+
+    // The original parameters must still be able to finish the interrupted run.
+    let resume_run = run(&[
+        "transform",
+        path(&source),
+        "--output",
+        path(&resumed),
+        "--identity",
+        "--memory-limit",
+        "4KiB",
+        "--max-shard-size",
+        "4B",
+        "--resume",
+    ]);
+    assert!(
+        resume_run.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resume_run.stderr)
+    );
+    assert_eq!(manifest_tensors(&resumed), manifest_tensors(&clean));
+    let planned: Vec<String> = plan
+        .output_layout
+        .shards
+        .iter()
+        .map(|shard| shard.filename.clone())
+        .collect();
+    let mut published = published_shards(&resumed);
+    published.sort();
+    let mut planned_sorted = planned.clone();
+    planned_sorted.sort();
+    assert_eq!(
+        published, planned_sorted,
+        "the published artifact must contain exactly the planned shards"
+    );
+}
+
+fn staging_files(work: &Path) -> Vec<String> {
+    let mut entries: Vec<String> = fs::read_dir(work)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            match entry.path().strip_prefix(work) {
+                Ok(relative) => relative.to_string_lossy().into_owned(),
+                Err(_) => entry.file_name().to_string_lossy().into_owned(),
+            }
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn published_shards(root: &Path) -> Vec<String> {
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            path.extension()
+                .is_some_and(|extension| extension == "safetensors")
+                .then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
 fn build_plan(source: &Path, memory_limit: u64, max_shard_size: u64) -> TransformPlan {
     let compiler: Compiler<HfBackend, Registry, IdentityExecutor> =
         Compiler::new(HfBackend, Registry::new(), IdentityExecutor::default());

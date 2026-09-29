@@ -73,8 +73,9 @@ pub trait ArtifactBackend {
         config: &TransformConfig,
     ) -> Result<OutputLayout>;
 
-    /// True when the staging directory already holds any file of `layout`, which
-    /// is the state a mid-execution interruption leaves behind.
+    /// True when the staging directory already holds safetensors output, which
+    /// is the state a mid-execution interruption leaves behind. Such staging is
+    /// resumed and strictly validated rather than re-created.
     fn staging_has_output(&self, staging: &Path, layout: &OutputLayout) -> bool;
 
     fn create_writer(&self, staging: &Path, layout: &OutputLayout)

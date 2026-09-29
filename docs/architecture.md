@@ -54,11 +54,18 @@ fingerprint and artifact output layout to produce a validated `TransformPlan`.
 
 ## Resume detection
 
-Interruption leaves the planned shard files in staging even though the index is
-written only after every operation, so the resume path is chosen from the
-output layout (`ArtifactBackend::staging_has_output`) rather than from a
-single-file name. A resumed run re-validates every existing shard header and
-length, re-hashes the checkpointed prefix and refuses a mismatch.
+Interruption leaves shard files in staging even though the index is written
+only after every operation, so the resume path is chosen from what staging
+already holds (`ArtifactBackend::staging_has_output`) rather than from a
+single-file name.
+
+The compiler validates the checkpoint contract immediately after planning,
+before it creates the staging directory, takes the lock or opens a writer. A
+resume whose parameters do not match the interrupted run is rejected with no
+filesystem side effects, so a mistyped flag cannot strand an interrupted run or
+leave stray shards behind. A resumed run then re-validates every existing shard
+header and length, re-hashes the checkpointed prefix, refuses a mismatch, and
+rejects weight files that are not part of the planned layout.
 
 ## Memory limit
 

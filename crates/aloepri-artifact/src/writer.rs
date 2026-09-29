@@ -6,7 +6,7 @@ use aloepri_core::{
     types::{ByteLength, ModelFingerprint, TensorDescriptor, TensorName},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -52,6 +52,27 @@ impl StreamingWriter {
             return Err(CompilerError::ResumeMismatch {
                 reason: format!("staging artifact directory {} is missing", root.display()),
             });
+        }
+        let planned: BTreeSet<&str> = layout
+            .shards
+            .iter()
+            .map(|shard| shard.filename.as_str())
+            .collect();
+        for entry in fs::read_dir(&root).map_err(|source| io_error(&root, source))? {
+            let entry = entry.map_err(|source| io_error(&root, source))?;
+            let path = entry.path();
+            let is_weight_file = path
+                .extension()
+                .is_some_and(|extension| extension == "safetensors");
+            let name = path.file_name().and_then(|value| value.to_str());
+            if is_weight_file && !name.is_some_and(|value| planned.contains(value)) {
+                return Err(CompilerError::ResumeMismatch {
+                    reason: format!(
+                        "{} is not part of the planned output layout",
+                        path.display()
+                    ),
+                });
+            }
         }
         let mut files = BTreeMap::new();
         for shard in &layout.shards {
@@ -294,5 +315,27 @@ mod tests {
             .unwrap();
         writer.sync().unwrap();
         assert_eq!(hash, writer.tensor_hash(&descriptor.name).unwrap());
+    }
+
+    #[test]
+    fn resume_rejects_weight_files_outside_the_planned_layout() {
+        let descriptor = TensorDescriptor {
+            name: TensorName::try_from("x").unwrap(),
+            shape: TensorShape::new(vec![3]),
+            dtype: DType::U8,
+            byte_length: ByteLength(3),
+            location: TensorLocation {
+                shard: ShardId(0),
+                offset: ByteOffset(0),
+                length: ByteLength(3),
+            },
+        };
+        let layout =
+            crate::layout::plan_output_layout(std::slice::from_ref(&descriptor), ByteLength(3))
+                .unwrap();
+        let directory = tempdir().unwrap();
+        drop(StreamingWriter::create(directory.path(), layout.clone()).unwrap());
+        fs::write(directory.path().join("stray.safetensors"), b"junk").unwrap();
+        assert!(StreamingWriter::resume(directory.path(), layout).is_err());
     }
 }

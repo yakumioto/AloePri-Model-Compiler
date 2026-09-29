@@ -34,11 +34,16 @@ impl ArtifactBackend for HfBackend {
     }
 
     fn staging_has_output(&self, staging: &Path, layout: &OutputLayout) -> bool {
-        layout
-            .shards
-            .iter()
-            .any(|shard| staging.join(&shard.filename).is_file())
-            || staging.join("model.safetensors.index.json").is_file()
+        let _ = layout;
+        staging.join("model.safetensors.index.json").is_file()
+            || fs::read_dir(staging).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "safetensors")
+                })
+            })
     }
 
     fn create_writer(

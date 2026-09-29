@@ -64,13 +64,13 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
         let output_name = output
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| CompilerError::Invariant("output has no usable file name".into()))?;
         let work = parent.join(format!(".{output_name}.aloepri-work"));
         let candidate = work.join("artifact");
+        let checkpoint_path = work.join("checkpoint.json");
 
         if output.exists() {
             if request.resume
@@ -96,19 +96,28 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
                 ),
             });
         }
+
+        // A resume must be rejected before the staging directory, the lock or
+        // any writer is touched: a mismatched contract would otherwise leave
+        // files behind that no later resume can clean up.
+        let resumed = if request.resume && work.exists() {
+            Some(self.backend.load_checkpoint(&checkpoint_path, &plan)?)
+        } else {
+            None
+        };
+
         fs::create_dir_all(&candidate).map_err(|source| io_error(&candidate, source))?;
         let lock_path = parent.join(format!(".{output_name}.aloepri.lock"));
         let _lock = self.backend.lock_output(&lock_path)?;
         self.backend
             .prepare_staging(&candidate, artifact.as_ref(), request.resume)?;
 
-        // Interruption leaves the planned shard files in place even though the
-        // index is written only after every operation, so resume is decided by
-        // the output layout rather than by the single-file name.
-        let mut writer = if request.resume
-            && self
-                .backend
-                .staging_has_output(&candidate, &plan.output_layout)
+        // Interruption leaves shard files in place even though the index is
+        // written only after every operation, so resume is decided by what the
+        // staging directory actually holds rather than by the single-file name.
+        let mut writer = if self
+            .backend
+            .staging_has_output(&candidate, &plan.output_layout)
         {
             self.backend
                 .resume_writer(&candidate, &plan.output_layout)?
@@ -117,16 +126,17 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
                 .create_writer(&candidate, &plan.output_layout)?
         };
 
-        let checkpoint_path = work.join("checkpoint.json");
-        let mut completed = if request.resume {
-            let completed = self.backend.load_checkpoint(&checkpoint_path, &plan)?;
-            self.validate_completed(&plan, &completed, writer.as_mut())?;
-            completed
-        } else {
-            let completed = BTreeMap::new();
-            self.backend
-                .store_checkpoint(&checkpoint_path, &plan, &completed)?;
-            completed
+        let mut completed = match resumed {
+            Some(completed) => {
+                self.validate_completed(&plan, &completed, writer.as_mut())?;
+                completed
+            }
+            None => {
+                let completed = BTreeMap::new();
+                self.backend
+                    .store_checkpoint(&checkpoint_path, &plan, &completed)?;
+                completed
+            }
         };
 
         let budget = MemoryBudget::new(request.config.memory_limit.0);
