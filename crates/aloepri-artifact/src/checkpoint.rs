@@ -12,6 +12,7 @@ use std::{
 };
 
 pub const CHECKPOINT_VERSION: u32 = 1;
+pub const TOKEN_CHECKPOINT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -21,6 +22,8 @@ pub struct Checkpoint {
     pub output_layout_hash: String,
     pub method: MethodContract,
     pub secret_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
     pub completed: BTreeMap<OperationId, String>,
 }
 
@@ -34,12 +37,13 @@ impl Checkpoint {
         completed: &BTreeMap<OperationId, String>,
     ) -> Result<Self> {
         Ok(Self {
-            schema_version: CHECKPOINT_VERSION,
+            schema_version: plan.version,
             source_fingerprint: plan.source_fingerprint.to_string(),
             plan_hash: plan.plan_hash.to_string(),
             output_layout_hash: layout_hash(&plan.output_layout)?,
             method: plan.method.clone(),
             secret_key_id: None,
+            secret_id: plan.secret_id.clone(),
             completed: completed.clone(),
         })
     }
@@ -54,9 +58,26 @@ impl Checkpoint {
         })?;
         let checkpoint: Self =
             serde_json::from_slice(&bytes).map_err(|source| json_error(path, source))?;
-        if checkpoint.schema_version != CHECKPOINT_VERSION {
+        if !matches!(
+            checkpoint.schema_version,
+            CHECKPOINT_VERSION | TOKEN_CHECKPOINT_VERSION
+        ) {
             return Err(CompilerError::UnsupportedVersion {
                 version: checkpoint.schema_version,
+            });
+        }
+        let identity = checkpoint.method == MethodContract::identity();
+        let token = checkpoint.method == MethodContract::aloepri_token();
+        let token_secret_valid = checkpoint.secret_id.as_deref().is_some_and(valid_secret_id);
+        if (!identity && !token)
+            || (checkpoint.schema_version == CHECKPOINT_VERSION
+                && (!identity || checkpoint.secret_id.is_some()))
+            || (checkpoint.schema_version == TOKEN_CHECKPOINT_VERSION
+                && (!token || !token_secret_valid))
+        {
+            return Err(CompilerError::InvalidArtifact {
+                path: path.to_owned(),
+                reason: "checkpoint method, version, and secret metadata disagree".into(),
             });
         }
         Ok(checkpoint)
@@ -91,6 +112,7 @@ impl Checkpoint {
             || self.output_layout_hash != layout_hash(&plan.output_layout)?
             || self.method != plan.method
             || self.secret_key_id.is_some()
+            || self.secret_id != plan.secret_id
         {
             return Err(CompilerError::ResumeMismatch {
                 reason: "checkpoint contract does not match the current plan".into(),
@@ -98,6 +120,13 @@ impl Checkpoint {
         }
         Ok(())
     }
+}
+
+fn valid_secret_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn temporary_path(path: &Path) -> PathBuf {

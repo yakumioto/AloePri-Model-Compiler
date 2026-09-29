@@ -1,8 +1,8 @@
 use aloepri_core::{
     error::{CompilerError, Result},
     model::{ArchitectureAdapter, ModelArtifact},
-    plan::{Operation, PlanDraft, TransformConfig},
-    types::{ByteLength, OutputDType, TensorName},
+    plan::{Operation, OperationKind, PlanDraft, TokenRole, TransformConfig},
+    types::{ByteLength, ByteOffset, DType, OutputDType, TensorName},
 };
 use serde_json::Value;
 
@@ -13,7 +13,7 @@ impl LlamaDenseAdapter {
         artifact.config().get("model_type").and_then(Value::as_str) == Some("llama")
     }
 
-    fn validate_schema(artifact: &dyn ModelArtifact) -> Result<()> {
+    fn validate_schema(artifact: &dyn ModelArtifact, token_method: bool) -> Result<()> {
         let config = artifact.config();
         let hidden = required_u64(config, "hidden_size")?;
         let layers = required_u64(config, "num_hidden_layers")?;
@@ -96,16 +96,87 @@ impl LlamaDenseAdapter {
             .get("tie_word_embeddings")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !tied
-            || artifact
-                .model_spec()
-                .tensor(&TensorName::try_from("lm_head.weight")?)
-                .is_some()
-        {
+        let lm_head = TensorName::try_from("lm_head.weight")?;
+        let has_lm_head = artifact.model_spec().tensor(&lm_head).is_some();
+        if !tied || has_lm_head {
             require_shape(artifact, "lm_head.weight", &[vocab, hidden])?;
+        }
+        if token_method {
+            if artifact
+                .model_spec()
+                .tensor(&TensorName::try_from("lm_head.bias")?)
+                .is_some()
+            {
+                return Err(CompilerError::Unsupported(
+                    "aloepri-token does not support lm_head.bias".into(),
+                ));
+            }
+            for name in ["model.embed_tokens.weight", "lm_head.weight"] {
+                if let Some(tensor) = artifact.model_spec().tensor(&TensorName::try_from(name)?) {
+                    if !matches!(tensor.dtype, DType::F32 | DType::F16 | DType::BF16) {
+                        return Err(CompilerError::Unsupported(format!(
+                            "aloepri-token does not support {name} dtype {:?}",
+                            tensor.dtype
+                        )));
+                    }
+                    if tensor.shape.as_slice().first().copied() != Some(vocab) {
+                        return Err(CompilerError::InvalidTensor {
+                            name: name.into(),
+                            reason: "vocabulary dimension does not match config".into(),
+                        });
+                    }
+                }
+            }
+            if tied && has_lm_head {
+                ensure_tied_weights_match(artifact, &lm_head)?;
+            }
         }
         Ok(())
     }
+}
+
+fn ensure_tied_weights_match(artifact: &dyn ModelArtifact, lm_head: &TensorName) -> Result<()> {
+    let embedding_name = TensorName::try_from("model.embed_tokens.weight")?;
+    let embedding = artifact
+        .model_spec()
+        .tensor(&embedding_name)
+        .ok_or_else(|| CompilerError::MissingTensor {
+            name: embedding_name.to_string(),
+        })?;
+    let head =
+        artifact
+            .model_spec()
+            .tensor(lm_head)
+            .ok_or_else(|| CompilerError::MissingTensor {
+                name: lm_head.to_string(),
+            })?;
+    if embedding.dtype != head.dtype
+        || embedding.shape != head.shape
+        || embedding.byte_length != head.byte_length
+    {
+        return Err(CompilerError::InvalidTensor {
+            name: lm_head.to_string(),
+            reason: "tied embedding and output projection metadata differ".into(),
+        });
+    }
+    let mut embedding_reader = artifact.tensor_reader(&embedding_name)?;
+    let mut head_reader = artifact.tensor_reader(lm_head)?;
+    let mut left = vec![0_u8; 64 * 1024];
+    let mut right = vec![0_u8; left.len()];
+    let mut offset = 0_u64;
+    while offset < embedding.byte_length.0 {
+        let size = (embedding.byte_length.0 - offset).min(left.len() as u64) as usize;
+        embedding_reader.read_bytes(ByteOffset(offset), &mut left[..size])?;
+        head_reader.read_bytes(ByteOffset(offset), &mut right[..size])?;
+        if left[..size] != right[..size] {
+            return Err(CompilerError::InvalidTensor {
+                name: lm_head.to_string(),
+                reason: "tied embedding and output projection bytes differ".into(),
+            });
+        }
+        offset += size as u64;
+    }
+    Ok(())
 }
 
 impl ArchitectureAdapter for LlamaDenseAdapter {
@@ -118,23 +189,40 @@ impl ArchitectureAdapter for LlamaDenseAdapter {
         artifact: &dyn ModelArtifact,
         config: &TransformConfig,
     ) -> Result<PlanDraft> {
-        if config.method.id != "identity" {
-            return Err(CompilerError::Unsupported(
-                "only identity is available".into(),
-            ));
+        let identity = config.method == aloepri_core::MethodContract::identity();
+        let token = config.method == aloepri_core::MethodContract::aloepri_token();
+        if !identity && !token {
+            return Err(CompilerError::Unsupported(format!(
+                "unsupported method {}/{}",
+                config.method.id, config.method.version
+            )));
         }
-        Self::validate_schema(artifact)?;
+        Self::validate_schema(artifact, token)?;
         let operations = artifact
             .tensors()
             .iter()
             .enumerate()
-            .map(|(index, tensor)| Operation {
-                id: aloepri_core::types::OperationId(index as u32),
-                tensor: tensor.name.clone(),
-                source: tensor.clone(),
-                output_dtype: OutputDType::Preserve,
-                memory_requirement: ByteLength(bounded_chunk(tensor.byte_length.0)),
-                dependencies: Vec::new(),
+            .map(|(index, tensor)| {
+                let kind = if token && tensor.name.as_str() == "model.embed_tokens.weight" {
+                    OperationKind::TokenPermutation {
+                        role: TokenRole::InputEmbedding,
+                    }
+                } else if token && tensor.name.as_str() == "lm_head.weight" {
+                    OperationKind::TokenPermutation {
+                        role: TokenRole::OutputProjection,
+                    }
+                } else {
+                    OperationKind::Copy
+                };
+                Operation {
+                    id: aloepri_core::types::OperationId(index as u32),
+                    tensor: tensor.name.clone(),
+                    source: tensor.clone(),
+                    output_dtype: OutputDType::Preserve,
+                    memory_requirement: ByteLength(bounded_chunk(tensor.byte_length.0)),
+                    dependencies: Vec::new(),
+                    kind,
+                }
             })
             .collect();
         Ok(PlanDraft {

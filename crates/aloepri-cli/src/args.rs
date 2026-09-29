@@ -24,8 +24,10 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct PlanArgs {
     pub model: PathBuf,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "method")]
     pub identity: bool,
+    #[arg(long)]
+    pub method: Option<String>,
     #[arg(long, default_value = "256MiB", value_parser = parse_size)]
     pub memory_limit: u64,
     #[arg(long, default_value = "4GiB", value_parser = parse_size)]
@@ -37,8 +39,12 @@ pub struct TransformArgs {
     pub model: PathBuf,
     #[arg(long)]
     pub output: PathBuf,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "method")]
     pub identity: bool,
+    #[arg(long)]
+    pub method: Option<String>,
+    #[arg(long)]
+    pub secret_output: Option<PathBuf>,
     #[arg(long, default_value = "256MiB", value_parser = parse_size)]
     pub memory_limit: u64,
     #[arg(long, default_value = "4GiB", value_parser = parse_size)]
@@ -74,9 +80,18 @@ pub fn parse_size(value: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {value} overflows"))
 }
 
-pub fn require_identity(identity: bool) -> Result<()> {
-    if !identity {
-        return Err(anyhow!("v0.1 requires the explicit --identity method"));
+pub fn resolve_method(
+    identity: bool,
+    method: Option<&str>,
+) -> Result<aloepri_core::MethodContract> {
+    if identity && method.is_some() {
+        return Err(anyhow!("--identity and --method cannot be used together"));
     }
-    Ok(())
+    match (identity, method) {
+        (true, None) | (false, Some("identity")) => Ok(aloepri_core::MethodContract::identity()),
+        (false, Some("aloepri-token")) => Ok(aloepri_core::MethodContract::aloepri_token()),
+        (false, Some(other)) => Err(anyhow!("unsupported transform method {other}")),
+        (false, None) => Err(anyhow!("an explicit --identity or --method is required")),
+        (true, Some(_)) => unreachable!("method conflict is checked above"),
+    }
 }

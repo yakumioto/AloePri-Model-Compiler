@@ -22,9 +22,15 @@ pub fn verify_artifact(root: &Path) -> Result<VerificationOutcome> {
     };
     let mut manifest_verified = false;
     if let Some(manifest) = manifest {
-        if !manifest.standard_hf_checkpoint || manifest.method.id != "identity" {
+        let valid_method_version = (manifest.artifact_version == 1
+            && manifest.method == aloepri_core::MethodContract::identity()
+            && manifest.secret_id.is_none())
+            || (manifest.artifact_version == 2
+                && manifest.method == aloepri_core::MethodContract::aloepri_token()
+                && manifest.secret_id.is_some());
+        if !manifest.standard_hf_checkpoint || !valid_method_version {
             return Err(CompilerError::OutputCorrupted {
-                reason: "manifest is not an identity standard HF checkpoint".into(),
+                reason: "manifest method or schema is not supported".into(),
             });
         }
         let config_hash = blake3::hash(artifact.config_bytes()).to_hex().to_string();

@@ -244,6 +244,25 @@ impl ModelFingerprint {
         &self.0
     }
 
+    pub fn from_hex(value: &str) -> Result<Self, CompilerError> {
+        if value.len() != 64 {
+            return Err(CompilerError::Invariant(
+                "model fingerprint must contain 64 hexadecimal characters".into(),
+            ));
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+            let high = hex_digit(chunk[0]).ok_or_else(|| {
+                CompilerError::Invariant("model fingerprint contains non-hexadecimal data".into())
+            })?;
+            let low = hex_digit(chunk[1]).ok_or_else(|| {
+                CompilerError::Invariant("model fingerprint contains non-hexadecimal data".into())
+            })?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+
     pub fn to_hex(self) -> String {
         self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -252,6 +271,15 @@ impl ModelFingerprint {
 impl fmt::Display for ModelFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_hex())
+    }
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
