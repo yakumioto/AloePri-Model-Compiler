@@ -1,0 +1,18 @@
+[package]
+name = "aloepri-artifact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+aloepri-core.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rustix = { version = "1.1.5", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3.23"

@@ -1,0 +1,29 @@
+[package]
+name = "aloepri-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "aloepri"
+path = "src/main.rs"
+
+[dependencies]
+aloepri-artifact.workspace = true
+aloepri-architecture.workspace = true
+aloepri-core.workspace = true
+aloepri-secret.workspace = true
+aloepri-transform.workspace = true
+anyhow = "1.0"
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+aloepri-artifact.workspace = true
+aloepri-architecture.workspace = true
+aloepri-core.workspace = true
+tempfile = "3.23"
