@@ -4,23 +4,14 @@ use crate::{
     manifest::{Manifest, TensorManifest},
 };
 use aloepri_core::{
+    backend::VerificationOutcome,
     error::{CompilerError, Result},
     model::ModelArtifact,
     types::TensorName,
 };
-use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
 
-#[derive(Clone, Debug, Serialize)]
-pub struct VerificationReport {
-    pub structure_valid: bool,
-    pub manifest_verified: bool,
-    pub tensor_count: usize,
-    pub payload_bytes: u64,
-    pub artifact_fingerprint: String,
-}
-
-pub fn verify_artifact(root: &Path) -> Result<VerificationReport> {
+pub fn verify_artifact(root: &Path) -> Result<VerificationOutcome> {
     let artifact = HfArtifact::open(root)?;
     let fingerprint = artifact.fingerprint()?;
     let manifest_path = root.join("aloepri.json");
@@ -87,7 +78,7 @@ pub fn verify_artifact(root: &Path) -> Result<VerificationReport> {
         }
         manifest_verified = true;
     }
-    Ok(VerificationReport {
+    Ok(VerificationOutcome {
         structure_valid: true,
         manifest_verified,
         tensor_count: artifact.tensors().len(),

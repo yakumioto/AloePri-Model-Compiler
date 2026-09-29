@@ -26,6 +26,13 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     pub fn new(plan: &TransformPlan) -> Result<Self> {
+        Self::with_completed(plan, &BTreeMap::new())
+    }
+
+    pub fn with_completed(
+        plan: &TransformPlan,
+        completed: &BTreeMap<OperationId, String>,
+    ) -> Result<Self> {
         Ok(Self {
             schema_version: CHECKPOINT_VERSION,
             source_fingerprint: plan.source_fingerprint.to_string(),
@@ -33,7 +40,7 @@ impl Checkpoint {
             output_layout_hash: layout_hash(&plan.output_layout)?,
             method: plan.method.clone(),
             secret_key_id: None,
-            completed: BTreeMap::new(),
+            completed: completed.clone(),
         })
     }
 

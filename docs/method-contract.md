@@ -23,4 +23,7 @@ The candidate artifact is verified from disk before publication. Publication
 uses a fixed lock file and Linux `renameat2(RENAME_NOREPLACE)` on the same
 filesystem; an existing output is an error. A failed run leaves its owned
 staging directory for explicit `--resume` and never exposes it as the final
-artifact.
+artifact. Because the index and the single-file name appear only after every
+operation, resume is detected from the planned output layout: a staging
+directory holding any planned shard file is resumed, so a sharded run that was
+interrupted mid-execution is recoverable rather than requiring manual cleanup.

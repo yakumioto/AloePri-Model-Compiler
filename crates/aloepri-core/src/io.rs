@@ -1,7 +1,7 @@
 use crate::{
     error::{CompilerError, Result},
     memory::MemoryBudget,
-    types::{ByteLength, ByteOffset, ModelFingerprint, TensorDescriptor},
+    types::{ByteLength, ByteOffset, ModelFingerprint, TensorDescriptor, TensorName},
 };
 
 pub trait TensorReader: Send {
@@ -21,6 +21,11 @@ pub trait TensorWriter {
     ) -> Result<ModelFingerprint>;
 
     fn sync(&mut self) -> Result<()>;
+}
+
+pub trait OutputWriter: TensorWriter {
+    fn hash_tensor(&mut self, name: &TensorName) -> Result<ModelFingerprint>;
+    fn write_index(&mut self) -> Result<()>;
 }
 
 pub fn copy_tensor(

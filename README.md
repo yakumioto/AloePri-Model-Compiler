@@ -23,9 +23,31 @@ cargo test --workspace --locked
 cargo build --release --workspace --locked
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`. The independent byte-level
-oracle is `tests/reference/identity_oracle.py`; it requires only Python's
-standard library unless optional BLAKE3/Transformers loading is requested.
+The toolchain is pinned in `rust-toolchain.toml`.
+
+## Acceptance checks
+
+`tests/reference/identity_oracle.py` is an independent byte-level oracle. It
+compares the config bytes, tensor names, dtypes, shapes and payloads of an input
+and an output artifact, optionally cross-checks per-tensor BLAKE3 digests, and
+with `--transformers-load` reads every output shard through `safetensors` and
+loads the artifact with a locally-only Transformers instance, asserting the
+loading report has no unexpected, mismatched or error entries.
+
+```bash
+HF_HUB_OFFLINE=1 python tests/reference/identity_oracle.py \
+  --source INPUT --output OUTPUT --transformers-load
+```
+
+`scripts/large_model_smoke.py` generates synthetic artifacts whose payload far
+exceeds `--memory-limit`, runs the release binary as a separate process and
+reports each process peak RSS; the assertion is that peak RSS does not grow with
+the model payload.
+
+```bash
+python scripts/large_model_smoke.py --binary target/release/aloepri \
+  --work-dir ./smoke --memory-limit 32MiB --sizes 128MiB,512MiB
+```
 
 ## CLI
 

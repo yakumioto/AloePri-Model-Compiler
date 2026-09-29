@@ -3,6 +3,7 @@ use crate::{
     reader::FileTensorReader,
 };
 use aloepri_core::{
+    backend::ShardSummary,
     error::{CompilerError, Result, io_error, json_error},
     io::TensorReader,
     model::{ModelArtifact, ModelSpec},
@@ -324,6 +325,21 @@ impl ModelArtifact for HfArtifact {
 
     fn model_spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    fn sidecars(&self) -> Result<BTreeMap<String, Vec<u8>>> {
+        self.sidecar_bytes()
+    }
+
+    fn shards(&self) -> Vec<ShardSummary> {
+        self.shards
+            .iter()
+            .map(|shard| ShardSummary {
+                filename: shard.filename.clone(),
+                file_length: shard.file_length,
+                payload_length: shard.payload_length,
+            })
+            .collect()
     }
 
     fn tensor_reader(&self, name: &TensorName) -> Result<Box<dyn TensorReader>> {

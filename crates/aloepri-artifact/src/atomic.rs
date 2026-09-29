@@ -1,3 +1,4 @@
+use aloepri_core::backend::OutputLockGuard;
 use aloepri_core::error::{CompilerError, Result, io_error};
 use rustix::fs::{RenameFlags, renameat_with};
 use std::{
@@ -9,6 +10,8 @@ pub struct OutputLock {
     _file: File,
     path: PathBuf,
 }
+
+impl OutputLockGuard for OutputLock {}
 
 impl OutputLock {
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self> {

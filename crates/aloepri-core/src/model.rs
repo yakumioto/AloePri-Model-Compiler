@@ -1,4 +1,5 @@
 use crate::{
+    backend::ShardSummary,
     error::Result,
     io::TensorReader,
     plan::{PlanDraft, TransformConfig},
@@ -34,6 +35,15 @@ pub trait ModelArtifact: Send + Sync {
         self.tensor_reader(name)
     }
     fn fingerprint(&self) -> Result<ModelFingerprint>;
+
+    /// Preserved, allowlisted files that travel with the weights.
+    fn sidecars(&self) -> Result<BTreeMap<String, Vec<u8>>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn shards(&self) -> Vec<ShardSummary> {
+        Vec::new()
+    }
 }
 
 pub trait ArchitectureAdapter: Send + Sync {

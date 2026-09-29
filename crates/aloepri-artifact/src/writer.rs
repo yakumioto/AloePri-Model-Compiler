@@ -1,6 +1,6 @@
 use aloepri_core::{
     error::{CompilerError, Result, io_error},
-    io::{TensorReader, TensorWriter, copy_tensor},
+    io::{OutputWriter, TensorReader, TensorWriter, copy_tensor},
     memory::MemoryBudget,
     plan::OutputLayout,
     types::{ByteLength, ModelFingerprint, TensorDescriptor, TensorName},
@@ -108,18 +108,7 @@ impl StreamingWriter {
         &self.layout
     }
 
-    pub fn write_index(&self) -> Result<()> {
-        if let Some(index) = &self.layout.index {
-            let path = self.root.join("model.safetensors.index.json");
-            let mut file = File::create(&path).map_err(|source| io_error(&path, source))?;
-            file.write_all(index)
-                .map_err(|source| io_error(&path, source))?;
-            file.sync_all().map_err(|source| io_error(&path, source))?;
-        }
-        Ok(())
-    }
-
-    pub fn hash_tensor(&mut self, name: &TensorName) -> Result<ModelFingerprint> {
+    pub fn tensor_hash(&mut self, name: &TensorName) -> Result<ModelFingerprint> {
         let output = self
             .layout
             .tensor(name)
@@ -225,6 +214,23 @@ impl TensorWriter for StreamingWriter {
     }
 }
 
+impl OutputWriter for StreamingWriter {
+    fn hash_tensor(&mut self, name: &TensorName) -> Result<ModelFingerprint> {
+        self.tensor_hash(name)
+    }
+
+    fn write_index(&mut self) -> Result<()> {
+        if let Some(index) = &self.layout.index {
+            let path = self.root.join("model.safetensors.index.json");
+            let mut file = File::create(&path).map_err(|source| io_error(&path, source))?;
+            file.write_all(index)
+                .map_err(|source| io_error(&path, source))?;
+            file.sync_all().map_err(|source| io_error(&path, source))?;
+        }
+        Ok(())
+    }
+}
+
 fn write_header(
     file: &mut File,
     header: &[u8],
@@ -287,6 +293,6 @@ mod tests {
             )
             .unwrap();
         writer.sync().unwrap();
-        assert_eq!(hash, writer.hash_tensor(&descriptor.name).unwrap());
+        assert_eq!(hash, writer.tensor_hash(&descriptor.name).unwrap());
     }
 }
