@@ -2,8 +2,8 @@ use crate::{
     error::Result,
     io::OutputWriter,
     model::ModelArtifact,
-    plan::{OutputLayout, TransformConfig, TransformPlan},
-    types::OperationId,
+    plan::{OutputLayout, RuntimeContract, TransformConfig, TransformPlan},
+    types::{OperationId, OutputTensorDescriptor},
 };
 use serde::Serialize;
 use std::{
@@ -31,10 +31,23 @@ pub struct InspectionReport {
     pub fingerprint: String,
 }
 
+/// Layered verification result.
+///
+/// `structure_valid` proves the container parses; `manifest_verified` proves a
+/// v3 contract matched its plan. `standard_hf_checkpoint` is a contract
+/// declaration, not the result of loading the artifact with Transformers, and
+/// `semantic_verification` records that no model-level check ran.
 #[derive(Clone, Debug, Serialize)]
 pub struct VerificationOutcome {
     pub structure_valid: bool,
     pub manifest_verified: bool,
+    pub artifact_valid: bool,
+    pub plan_verified: bool,
+    pub standard_hf_checkpoint: Option<bool>,
+    pub runtime_required: bool,
+    pub verification_scope: String,
+    pub semantic_verification: String,
+    pub runtime_contract: Option<RuntimeContract>,
     pub tensor_count: usize,
     pub payload_bytes: u64,
     pub artifact_fingerprint: String,
@@ -52,7 +65,9 @@ pub struct TransformRequest {
 pub struct TransformReport {
     pub plan_hash: String,
     pub tensor_count: usize,
+    pub source_tensor_count: usize,
     pub payload_bytes: u64,
+    pub source_payload_bytes: u64,
     pub shards: Vec<ShardSummary>,
     pub completed_operations: usize,
     pub verification: VerificationOutcome,
@@ -67,11 +82,16 @@ pub struct TransformReport {
 pub trait ArtifactBackend {
     fn open(&self, root: &Path) -> Result<Box<dyn ModelArtifact>>;
 
+    /// Plan the physical layout from the output descriptors alone.
     fn plan_output(
         &self,
-        artifact: &dyn ModelArtifact,
+        outputs: &[OutputTensorDescriptor],
         config: &TransformConfig,
     ) -> Result<OutputLayout>;
+
+    /// Reject a layout whose header/index/ranges are not internally consistent.
+    /// Called before the writer creates any file.
+    fn validate_output_layout(&self, layout: &OutputLayout) -> Result<()>;
 
     /// True when the staging directory already holds safetensors output, which
     /// is the state a mid-execution interruption leaves behind. Such staging is

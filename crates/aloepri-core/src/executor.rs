@@ -1,17 +1,17 @@
 use crate::{
     error::Result,
-    io::OutputWriter,
+    io::{TensorSink, copy_source_to_sink},
     memory::MemoryBudget,
     model::ModelArtifact,
     plan::{Operation, TransformConfig},
-    types::ModelFingerprint,
 };
 
 /// Mechanical execution of one plan operation.
 ///
-/// The compiler owns ordering, budgeting and checkpointing; an executor only
-/// performs the byte-level work of a single operation and reports its digest.
-/// Executors do not know model names, tensor naming rules or architectures.
+/// The compiler owns ordering, budgeting, sinks and checkpointing; an executor
+/// only produces the bytes of a single output into the sink it is handed. It
+/// never creates files, plans shards, writes manifests or reports completion —
+/// the compiler derives completion from the sink itself.
 pub trait TransformExecutor {
     fn requirements(&self, config: &TransformConfig) -> Result<()>;
 
@@ -19,12 +19,12 @@ pub trait TransformExecutor {
         &self,
         artifact: &dyn ModelArtifact,
         operation: &Operation,
-        writer: &mut dyn OutputWriter,
+        sink: &mut dyn TensorSink,
         budget: &MemoryBudget,
-    ) -> Result<ModelFingerprint>;
+    ) -> Result<()>;
 }
 
-/// The method-agnostic copy executor: read a bounded chunk, write it, hash it.
+/// The method-agnostic copy executor: read a bounded chunk and hand it to the sink.
 #[derive(Default)]
 pub struct StreamingExecutor;
 
@@ -37,10 +37,17 @@ impl TransformExecutor for StreamingExecutor {
         &self,
         artifact: &dyn ModelArtifact,
         operation: &Operation,
-        writer: &mut dyn OutputWriter,
+        sink: &mut dyn TensorSink,
         budget: &MemoryBudget,
-    ) -> Result<ModelFingerprint> {
-        let mut reader = artifact.tensor_reader(&operation.tensor)?;
-        writer.write_tensor(&operation.source, reader.as_mut(), budget)
+    ) -> Result<()> {
+        let input = &operation.inputs[0].descriptor;
+        let mut reader = artifact.tensor_reader(&input.name)?;
+        copy_source_to_sink(
+            reader.as_mut(),
+            sink,
+            input,
+            &operation.output.descriptor,
+            budget,
+        )
     }
 }

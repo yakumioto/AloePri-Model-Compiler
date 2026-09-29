@@ -1,6 +1,7 @@
+use crate::manifest::layout_hash;
 use aloepri_core::{
     error::{CompilerError, Result, io_error, json_error},
-    plan::{MethodContract, OutputLayout, TransformPlan},
+    plan::{MethodContract, RuntimeContract, SCHEMA_VERSION, TransformPlan},
     types::OperationId,
 };
 use serde::{Deserialize, Serialize};
@@ -11,9 +12,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Legacy checkpoint schema written alongside v1 identity artifacts.
 pub const CHECKPOINT_VERSION: u32 = 1;
+/// Legacy checkpoint schema written alongside v2 token artifacts.
 pub const TOKEN_CHECKPOINT_VERSION: u32 = 2;
 
+/// Resumable execution state.
+///
+/// Only the current schema may be resumed: a legacy v1/v2 checkpoint belongs to
+/// a legacy execution model and is rejected rather than silently upgraded. The
+/// runtime contract is part of the binding so a different physical expansion,
+/// method or source fingerprint cannot reuse a checkpoint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub schema_version: u32,
@@ -24,6 +33,8 @@ pub struct Checkpoint {
     pub secret_key_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_contract: Option<RuntimeContract>,
     pub completed: BTreeMap<OperationId, String>,
 }
 
@@ -44,6 +55,7 @@ impl Checkpoint {
             method: plan.method.clone(),
             secret_key_id: None,
             secret_id: plan.secret_id.clone(),
+            runtime_contract: Some(plan.runtime_contract.clone()),
             completed: completed.clone(),
         })
     }
@@ -58,26 +70,14 @@ impl Checkpoint {
         })?;
         let checkpoint: Self =
             serde_json::from_slice(&bytes).map_err(|source| json_error(path, source))?;
-        if !matches!(
-            checkpoint.schema_version,
-            CHECKPOINT_VERSION | TOKEN_CHECKPOINT_VERSION
-        ) {
+        if checkpoint.schema_version != SCHEMA_VERSION {
             return Err(CompilerError::UnsupportedVersion {
                 version: checkpoint.schema_version,
             });
         }
-        let identity = checkpoint.method == MethodContract::identity();
-        let token = checkpoint.method == MethodContract::aloepri_token();
-        let token_secret_valid = checkpoint.secret_id.as_deref().is_some_and(valid_secret_id);
-        if (!identity && !token)
-            || (checkpoint.schema_version == CHECKPOINT_VERSION
-                && (!identity || checkpoint.secret_id.is_some()))
-            || (checkpoint.schema_version == TOKEN_CHECKPOINT_VERSION
-                && (!token || !token_secret_valid))
-        {
-            return Err(CompilerError::InvalidArtifact {
-                path: path.to_owned(),
-                reason: "checkpoint method, version, and secret metadata disagree".into(),
+        if checkpoint.runtime_contract.is_none() {
+            return Err(CompilerError::ResumeMismatch {
+                reason: "a resumable checkpoint must carry a runtime contract".into(),
             });
         }
         Ok(checkpoint)
@@ -107,12 +107,14 @@ impl Checkpoint {
     }
 
     pub fn validate_against(&self, plan: &TransformPlan) -> Result<()> {
-        if self.source_fingerprint != plan.source_fingerprint.to_string()
+        if self.schema_version != plan.version
+            || self.source_fingerprint != plan.source_fingerprint.to_string()
             || self.plan_hash != plan.plan_hash.to_string()
             || self.output_layout_hash != layout_hash(&plan.output_layout)?
             || self.method != plan.method
             || self.secret_key_id.is_some()
             || self.secret_id != plan.secret_id
+            || self.runtime_contract.as_ref() != Some(&plan.runtime_contract)
         {
             return Err(CompilerError::ResumeMismatch {
                 reason: "checkpoint contract does not match the current plan".into(),
@@ -120,13 +122,6 @@ impl Checkpoint {
         }
         Ok(())
     }
-}
-
-fn valid_secret_id(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -138,10 +133,4 @@ fn temporary_path(path: &Path) -> PathBuf {
         .unwrap_or("checkpoint");
     temporary.set_file_name(format!("{name}{suffix}"));
     temporary
-}
-
-pub fn layout_hash(layout: &OutputLayout) -> Result<String> {
-    let bytes =
-        serde_json::to_vec(layout).map_err(|error| CompilerError::Invariant(error.to_string()))?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
 }

@@ -27,3 +27,16 @@ When `tie_word_embeddings` is true and the physical checkpoint omits
 identity plan keeps the physical inventory unchanged and never synthesizes an
 output tensor. Extra physical tensors are copied transparently as physical
 inventory entries; they are not interpreted as architecture semantics.
+
+The adapter also emits a runtime contract alongside its operations. For the
+dense Llama adapter this is the `huggingface` runtime with
+`standard_hf_checkpoint = true`, physical dimensions equal to the logical ones,
+and the logical dimensions taken from the config keys that are actually present
+(`hidden_size`, `num_hidden_layers`, `num_attention_heads`,
+`num_key_value_heads`, `intermediate_size`, `vocab_size`, `head_dim`). A
+verifier recomputes agreement between those recorded dimensions and the config
+rather than trusting the contract.
+
+The registry is not a general plugin framework: `Registry::detect` recognises
+only the registered Llama adapter. Test-only adapters implement
+`ArchitectureRegistry` directly rather than reusing `Registry::with_adapters`.

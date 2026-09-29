@@ -1,11 +1,10 @@
 use aloepri_core::{
     error::{CompilerError, Result},
     executor::{StreamingExecutor, TransformExecutor},
-    io::OutputWriter,
+    io::TensorSink,
     memory::MemoryBudget,
     model::ModelArtifact,
     plan::{MethodContract, Operation, TransformConfig},
-    types::ModelFingerprint,
 };
 
 /// Identity transformation: byte-for-byte copy with no dtype conversion.
@@ -47,10 +46,10 @@ impl TransformExecutor for IdentityExecutor {
         &self,
         artifact: &dyn ModelArtifact,
         operation: &Operation,
-        writer: &mut dyn OutputWriter,
+        sink: &mut dyn TensorSink,
         budget: &MemoryBudget,
-    ) -> Result<ModelFingerprint> {
+    ) -> Result<()> {
         self.executor
-            .execute_operation(artifact, operation, writer, budget)
+            .execute_operation(artifact, operation, sink, budget)
     }
 }

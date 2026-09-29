@@ -2,8 +2,8 @@ use crate::{
     atomic::{OutputLock, publish_no_replace, sync_directory},
     checkpoint::Checkpoint,
     hf::HfArtifact,
-    layout::plan_output_layout,
-    manifest::{Manifest, TensorManifest},
+    layout::{plan_output_layout, validate_output_layout},
+    manifest::{Manifest, TensorManifest, layout_hash},
     verify::verify_artifact,
     writer::StreamingWriter,
 };
@@ -13,7 +13,7 @@ use aloepri_core::{
     io::OutputWriter,
     model::ModelArtifact,
     plan::{OutputLayout, TransformConfig, TransformPlan},
-    types::OperationId,
+    types::{OperationId, OutputTensorDescriptor},
 };
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -27,10 +27,14 @@ impl ArtifactBackend for HfBackend {
 
     fn plan_output(
         &self,
-        artifact: &dyn ModelArtifact,
+        outputs: &[OutputTensorDescriptor],
         config: &TransformConfig,
     ) -> Result<OutputLayout> {
-        plan_output_layout(artifact.tensors(), config.max_shard_size)
+        plan_output_layout(outputs, config.max_shard_size)
+    }
+
+    fn validate_output_layout(&self, layout: &OutputLayout) -> Result<()> {
+        validate_output_layout(layout)
     }
 
     fn staging_has_output(&self, staging: &Path, layout: &OutputLayout) -> bool {
@@ -123,7 +127,7 @@ impl ArtifactBackend for HfBackend {
         writer: &mut dyn OutputWriter,
     ) -> Result<()> {
         let mut tensors = Vec::new();
-        for descriptor in artifact.tensors() {
+        for descriptor in &plan.output_inventory {
             let digest = writer.hash_tensor(&descriptor.name)?;
             tensors.push(TensorManifest {
                 name: descriptor.name.clone(),
@@ -144,13 +148,16 @@ impl ArtifactBackend for HfBackend {
     }
 
     fn output_matches_plan(&self, output: &Path, plan: &TransformPlan) -> bool {
-        Manifest::read(output).is_ok_and(|manifest| {
-            manifest.artifact_version == plan.version
-                && manifest.method == plan.method
-                && manifest.secret_id == plan.secret_id
-                && manifest.source_fingerprint == plan.source_fingerprint.to_string()
-                && manifest.plan_hash == plan.plan_hash.to_string()
-        })
+        let Ok(manifest) = Manifest::read(output) else {
+            return false;
+        };
+        manifest.artifact_version == plan.version
+            && manifest.method == plan.method
+            && manifest.secret_id == plan.secret_id
+            && manifest.source_fingerprint == plan.source_fingerprint.to_string()
+            && manifest.plan_hash == plan.plan_hash.to_string()
+            && manifest.runtime_contract.as_ref() == Some(&plan.runtime_contract)
+            && manifest.layout_hash.as_deref() == layout_hash(&plan.output_layout).ok().as_deref()
     }
 
     fn publish(&self, staging: &Path, output: &Path) -> Result<()> {

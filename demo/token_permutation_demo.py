@@ -384,6 +384,9 @@ def greedy(model: Any, input_ids: Any, attention_mask: Any, permutation: list[in
     return sequence
 
 
+TOKEN_METHOD = {"id": "aloepri-token", "version": "0.1"}
+
+
 def validate_artifact_binding(
     secret: dict[str, Any],
     source_config: dict[str, Any],
@@ -397,11 +400,38 @@ def validate_artifact_binding(
         or obfuscated_config.get("vocab_size") != secret["vocab_size"]
     ):
         fail("client secret vocab_size does not match model config")
-    if manifest.get("artifact_version") != 2 or manifest.get("method") != {
-        "id": "aloepri-token",
-        "version": "0.1",
-    }:
-        fail("obfuscated artifact is not an aloepri-token manifest")
+    # Accept only the two explicitly supported versions. A loose
+    # `version >= 2` check would let a non-standard artifact reach the loader.
+    version = manifest.get("artifact_version")
+    if version == 2:
+        if manifest.get("method") != TOKEN_METHOD:
+            fail("obfuscated artifact is not an aloepri-token manifest")
+    elif version == 3:
+        if manifest.get("method") != TOKEN_METHOD:
+            fail("obfuscated artifact is not an aloepri-token manifest")
+        runtime = manifest.get("runtime_contract")
+        if not isinstance(runtime, dict):
+            fail("v3 manifest is missing its runtime contract")
+        # This demo loads the artifact with vanilla Transformers, so anything
+        # that is not a standard HF checkpoint must be refused here, before the
+        # loader is invoked.
+        if runtime.get("id") != "huggingface" or runtime.get(
+            "standard_hf_checkpoint"
+        ) is not True:
+            fail("v3 manifest does not declare a standard HF checkpoint")
+        if manifest.get("standard_hf_checkpoint") is not True:
+            fail("v3 manifest standard_hf_checkpoint flag disagrees with its runtime")
+        plan = manifest.get("plan")
+        if not isinstance(plan, dict):
+            fail("v3 manifest is missing its embedded plan")
+        if plan.get("method") != manifest.get("method") or plan.get(
+            "plan_hash"
+        ) != manifest.get("plan_hash"):
+            fail("v3 manifest disagrees with its embedded plan")
+        if plan.get("source_fingerprint") != manifest.get("source_fingerprint"):
+            fail("v3 manifest source fingerprint disagrees with its embedded plan")
+    else:
+        fail(f"unsupported obfuscated artifact version {version!r}")
     if manifest.get("secret_id") != secret["secret_id"]:
         fail("manifest secret_id does not match client secret")
     if manifest.get("source_fingerprint") != secret["source_fingerprint"]:
