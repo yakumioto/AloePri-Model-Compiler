@@ -143,6 +143,69 @@ fn indexed_input_can_be_repacked_to_one_shard() {
     assert!(!output.join("model.safetensors.index.json").exists());
 }
 
+#[test]
+fn unknown_architecture_is_rejected() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source");
+    let output = directory.path().join("output");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("config.json"), br#"{"model_type":"gpt2"}"#).unwrap();
+    write_safetensors(&source.join("model.safetensors"), &[("x", vec![1_u8, 2])]);
+
+    let result = Command::new(env!("CARGO_BIN_EXE_aloepri"))
+        .args([
+            "transform",
+            source.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--identity",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!output.exists());
+}
+
+#[test]
+fn model_larger_than_memory_limit_still_succeeds() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source");
+    let output = directory.path().join("output");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+    write_safetensors(
+        &source.join("model.safetensors"),
+        &[("x", vec![7_u8; 6000]), ("y", vec![9_u8; 6000])],
+    );
+
+    let result = Command::new(env!("CARGO_BIN_EXE_aloepri"))
+        .args([
+            "transform",
+            source.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--identity",
+            "--memory-limit",
+            "4KiB",
+            "--max-shard-size",
+            "4GiB",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let verify = Command::new(env!("CARGO_BIN_EXE_aloepri"))
+        .args(["verify", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(report["payload_bytes"], 12000);
+    assert_eq!(report["manifest_verified"], true);
+}
+
 fn write_safetensors(path: &Path, tensors: &[(&str, Vec<u8>)]) {
     let mut offset = 0_u64;
     let mut header = serde_json::Map::new();

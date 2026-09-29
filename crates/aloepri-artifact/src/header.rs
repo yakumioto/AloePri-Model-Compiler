@@ -289,4 +289,49 @@ mod tests {
         let parsed = read_safetensors_header(file.path()).unwrap();
         assert_eq!(parsed.tensors[0].byte_length, ByteLength(0));
     }
+
+    fn header_file(header: &[u8], payload: &[u8]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.write_all(payload).unwrap();
+        file
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_names_and_illegal_ranges() {
+        let duplicate =
+            br#"{"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"x":{"dtype":"U8","shape":[1],"data_offsets":[1,2]}}"#;
+        let file = header_file(duplicate, &[1, 2]);
+        assert!(read_safetensors_header(file.path()).is_err());
+
+        let beyond = br#"{"x":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#;
+        let file = header_file(beyond, &[1, 2]);
+        assert!(read_safetensors_header(file.path()).is_err());
+
+        let mismatch = br#"{"x":{"dtype":"U8","shape":[8],"data_offsets":[0,1]}}"#;
+        let file = header_file(mismatch, &[1]);
+        assert!(read_safetensors_header(file.path()).is_err());
+
+        let overlap = br#"{"a":{"dtype":"U8","shape":[2],"data_offsets":[0,2]},"b":{"dtype":"U8","shape":[2],"data_offsets":[1,3]}}"#;
+        let file = header_file(overlap, &[1, 2, 3]);
+        assert!(read_safetensors_header(file.path()).is_err());
+
+        let hole = br#"{"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"b":{"dtype":"U8","shape":[1],"data_offsets":[2,3]}}"#;
+        let file = header_file(hole, &[1, 2, 3]);
+        assert!(read_safetensors_header(file.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_header_length_beyond_the_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&u64::MAX.to_le_bytes()).unwrap();
+        assert!(read_safetensors_header(file.path()).is_err());
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&1024_u64.to_le_bytes()).unwrap();
+        file.write_all(b"{}").unwrap();
+        assert!(read_safetensors_header(file.path()).is_err());
+    }
 }

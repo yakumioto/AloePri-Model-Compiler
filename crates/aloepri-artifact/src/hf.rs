@@ -500,4 +500,84 @@ mod tests {
         assert_eq!(artifact.shards().len(), 2);
         assert_eq!(artifact.tensors().len(), 2);
     }
+
+    fn write_index(root: &Path, weight_map: serde_json::Value) {
+        fs::write(
+            root.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_index_pointing_at_the_wrong_shard() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.json"),
+            br#"{"model_type":"llama"}"#,
+        )
+        .unwrap();
+        write_shard(&directory.path().join("part-a.safetensors"), "a", &[1, 2]);
+        write_shard(&directory.path().join("part-b.safetensors"), "b", &[3]);
+        write_index(
+            directory.path(),
+            serde_json::json!({"a": "part-b.safetensors", "b": "part-b.safetensors"}),
+        );
+        assert!(HfArtifact::open(directory.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_index_missing_a_tensor() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.json"),
+            br#"{"model_type":"llama"}"#,
+        )
+        .unwrap();
+        write_two_tensors_shard(&directory.path().join("part-a.safetensors"));
+        write_index(
+            directory.path(),
+            serde_json::json!({"a": "part-a.safetensors"}),
+        );
+        assert!(HfArtifact::open(directory.path()).is_err());
+    }
+
+    fn write_two_tensors_shard(path: &Path) {
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "a".into(),
+            serde_json::json!({"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}),
+        );
+        header.insert(
+            "b".into(),
+            serde_json::json!({"dtype": "U8", "shape": [1], "data_offsets": [1, 2]}),
+        );
+        let mut header_bytes = serde_json::to_vec(&header).unwrap();
+        header_bytes.resize(
+            header_bytes.len() + ((8 - header_bytes.len() % 8) % 8),
+            b' ',
+        );
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&[1, 2]).unwrap();
+    }
+
+    #[test]
+    fn rejects_same_tensor_in_two_shards() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.json"),
+            br#"{"model_type":"llama"}"#,
+        )
+        .unwrap();
+        write_shard(&directory.path().join("part-a.safetensors"), "a", &[1]);
+        write_shard(&directory.path().join("part-b.safetensors"), "a", &[2]);
+        write_index(
+            directory.path(),
+            serde_json::json!({"a": "part-a.safetensors", "b": "part-b.safetensors"}),
+        );
+        assert!(HfArtifact::open(directory.path()).is_err());
+    }
 }
