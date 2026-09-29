@@ -1,0 +1,13 @@
+# Rust build outputs
+/target/
+
+# Local runtime files
+/.claude/
+/.multica/
+/CLAUDE.md
+/agent-handoff.md
+
+# Local environment
+.env
+.env.*
+!.env.example
