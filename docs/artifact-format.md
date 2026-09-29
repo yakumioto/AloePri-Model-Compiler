@@ -14,6 +14,12 @@ negative/reversed/out-of-bounds ranges, overlaps, holes, and shape/dtype byte
 length mismatches. Header and index parsing is bounded and the source config
 bytes are preserved exactly.
 
+Index entries are compared by resolved shard identity rather than by raw text,
+so the spellings Hugging Face itself treats as equivalent (`x`,
+`./x`, `sub/x`, `./sub/x`) all resolve to the same shard and a legitimate model
+is never rejected; an entry that resolves to a different shard is still
+reported. An index whose `total_size` disagrees with the payload is rejected.
+
 Output uses the standard safetensors header and `__metadata__.format = "pt"`.
 A small output is `model.safetensors`; multiple payload shards use
 `model-00001-of-000NN.safetensors` plus a new HF index. The shard target is a

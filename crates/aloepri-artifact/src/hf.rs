@@ -190,15 +190,25 @@ impl HfArtifact {
                     reason: "weight_map tensor set differs from physical shard tensor set".into(),
                 });
             }
+            let shard_ids: BTreeMap<&Path, usize> = shard_paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| (path.as_path(), index))
+                .collect();
             for (name, shard_name) in &index_file.weight_map {
                 let tensor_name = TensorName::try_from(name.as_str())?;
                 let descriptor = tensors.get(&tensor_name).expect("validated tensor set");
-                let actual_shard = &shards[descriptor.location.shard.0 as usize].filename;
-                if actual_shard != shard_name {
+                // Compare resolved shard identity, not raw strings: `./x` and
+                // `x` name the same shard and both are valid HF index entries.
+                let declared = validate_relative_path(&root, Path::new(shard_name))?;
+                if shard_ids.get(declared.as_path())
+                    != Some(&(descriptor.location.shard.0 as usize))
+                {
                     return Err(CompilerError::InvalidArtifact {
                         path: root.clone(),
                         reason: format!(
-                            "index maps {name} to {shard_name}, physical tensor is in {actual_shard}"
+                            "index maps {name} to {shard_name}, physical tensor is in {}",
+                            shards[descriptor.location.shard.0 as usize].filename
                         ),
                     });
                 }
@@ -523,6 +533,24 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn accepts_index_entries_with_a_dot_slash_prefix() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.json"),
+            br#"{"model_type":"llama"}"#,
+        )
+        .unwrap();
+        write_shard(&directory.path().join("part-a.safetensors"), "a", &[1, 2]);
+        write_shard(&directory.path().join("part-b.safetensors"), "b", &[3]);
+        write_index(
+            directory.path(),
+            serde_json::json!({"a": "./part-a.safetensors", "b": "./part-b.safetensors"}),
+        );
+        let artifact = HfArtifact::open(directory.path()).unwrap();
+        assert_eq!(artifact.tensors().len(), 2);
     }
 
     #[test]

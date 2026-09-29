@@ -152,9 +152,14 @@ fn interrupted_sharded_staging_resumes_to_the_clean_result() {
     let candidate = work.join("artifact");
     fs::create_dir_all(&candidate).unwrap();
     let plan = build_plan(&source, 4 * 1024, 4);
+    assert!(plan.output_layout.shards.len() > 1, "fixture must shard");
     let writer = StreamingWriter::create(&candidate, plan.output_layout.clone()).unwrap();
     drop(writer);
-    assert!(candidate.join("model-00001-of-00002.safetensors").is_file());
+    assert!(
+        candidate
+            .join(&plan.output_layout.shards[0].filename)
+            .is_file()
+    );
     assert!(!candidate.join("model.safetensors").exists());
     assert!(!candidate.join("model.safetensors.index.json").exists());
     aloepri_core::backend::ArtifactBackend::store_checkpoint(
@@ -333,30 +338,79 @@ fn manifest_tensors(root: &Path) -> Vec<Value> {
     parsed["tensors"].as_array().unwrap().clone()
 }
 
+/// A complete, minimal Llama dense schema: hidden=2, heads=1, kv_heads=1,
+/// head_dim=2, intermediate=2, vocab=2, one layer, tied embeddings.
+const LLAMA_CONFIG: &[u8] = br#"{"model_type":"llama","hidden_size":2,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"intermediate_size":2,"vocab_size":2,"tie_word_embeddings":true}"#;
+
+type Fixture = (&'static str, Vec<u64>, Vec<u8>);
+
+fn llama_tensors() -> Vec<Fixture> {
+    vec![
+        ("model.embed_tokens.weight", vec![2, 2], vec![1, 2, 3, 4]),
+        ("model.layers.0.input_layernorm.weight", vec![2], vec![5, 6]),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            vec![2, 2],
+            vec![7, 8, 9, 10],
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![2, 2],
+            vec![11, 12, 13, 14],
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            vec![2, 2],
+            vec![15, 16, 17, 18],
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            vec![2],
+            vec![19, 20],
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight",
+            vec![2, 2],
+            vec![21, 22, 23, 24],
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            vec![2, 2],
+            vec![25, 26, 27, 28],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            vec![2, 2],
+            vec![29, 30, 31, 32],
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            vec![2, 2],
+            vec![33, 34, 35, 36],
+        ),
+        ("model.norm.weight", vec![2], vec![37, 38]),
+    ]
+}
+
 fn prepare(source: &Path) {
     fs::create_dir(source).unwrap();
-    fs::write(source.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
-    write_safetensors(source.join("model.safetensors"), &[("x", vec![1_u8, 2, 3])]);
+    fs::write(source.join("config.json"), LLAMA_CONFIG).unwrap();
+    write_safetensors(&source.join("model.safetensors"), &llama_tensors());
 }
 
 fn prepare_sharded_input(source: &Path) {
-    fs::create_dir(source).unwrap();
-    fs::write(source.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
-    write_safetensors(
-        source.join("model.safetensors"),
-        &[("x", vec![1_u8, 2, 3]), ("y", vec![4_u8, 5])],
-    );
+    prepare(source);
 }
 
-fn write_safetensors(path: std::path::PathBuf, tensors: &[(&str, Vec<u8>)]) {
+fn write_safetensors(path: &Path, tensors: &[Fixture]) {
     let mut offset = 0_u64;
     let mut header = serde_json::Map::new();
     header.insert("__metadata__".into(), serde_json::json!({"format":"pt"}));
-    for (name, bytes) in tensors {
+    for (name, shape, bytes) in tensors {
         let end = offset + bytes.len() as u64;
         header.insert(
             (*name).into(),
-            serde_json::json!({"dtype":"U8","shape":[bytes.len()],"data_offsets":[offset,end]}),
+            serde_json::json!({"dtype":"U8","shape":shape,"data_offsets":[offset,end]}),
         );
         offset = end;
     }
@@ -370,7 +424,7 @@ fn write_safetensors(path: std::path::PathBuf, tensors: &[(&str, Vec<u8>)]) {
     file.write_all(&(header_bytes.len() as u64).to_le_bytes())
         .unwrap();
     file.write_all(&header_bytes).unwrap();
-    for (_, bytes) in tensors {
+    for (_, _, bytes) in tensors {
         file.write_all(bytes).unwrap();
     }
     file.rewind().unwrap();
