@@ -103,6 +103,28 @@ G1–G4 equivalence is a separate fail-closed harness: absolute 1e-5, all specif
 nodes and full/prefill/decode logits; generation runs only after prior gates
 pass. Structural verification never supplies these numerical results.
 
+### Internal precision experiment (not the default runtime)
+
+`F64AccumLinear` is the bounded diagnostic candidate
+`f32-state-f64-linear-acc-v1`: require F32 input/weight and no bias, perform
+`F.linear(input.double(), weight_chunk.double())`, cast each result back to
+F32 and reject non-finite output. A fixed 1024-output-row chunk bounds temporary
+F64 weights; no F64 parameters, persistent buffers, residuals or shadow model
+are introduced. Strict state_dict keys and physical tensor bits are preserved.
+
+Only the diagnostic first-layer down-only and gate/up/down evaluations use this
+class. All three fixed sequences must pass every original first-block node
+before considering a full-model integration. They did not pass, so the loader
+still installs ordinary F32 Linear and formal candidate G2/G3/G4 remain not_run.
+This experiment adds no artifact/runtime-contract field or schema version;
+SOURCE oracle use remains isolated from transformed-only inference.
+
+Error attribution retains elementwise telescoping vectors, source-baseline F32
+rounding, storage/output rounding and same-input native arithmetic differences.
+Maxima of separate components are not additive contributions or lower bounds.
+Higher arithmetic precision is not automatically equivalence to the original
+F32 baseline; neither unchanged encoding nor improved local errors satisfy AC10.
+
 ## Verification layering
 
 Structural verification and model semantic verification are separate:

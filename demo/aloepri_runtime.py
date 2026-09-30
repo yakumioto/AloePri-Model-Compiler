@@ -140,6 +140,56 @@ def tensor_specs(config, big_d):
     return specs
 
 
+F64_LINEAR_ROW_CHUNK = 1024
+
+
+class F64AccumLinear(torch.nn.Linear):
+    def __init__(self, in_features, out_features, bias=False, device=None, dtype=torch.float32):
+        require(not bias and dtype == torch.float32, "candidate Linear requires F32 parameters and no bias")
+        super().__init__(in_features, out_features, bias=False, device=device, dtype=dtype)
+        self.peak_f64_temporary_bytes = 0
+        self.peak_working_bytes = 0
+        self.elapsed_seconds = 0.0
+        self.calls = 0
+
+    @classmethod
+    def from_linear(cls, module):
+        require(module.bias is None and module.weight.dtype == torch.float32, "candidate Linear requires stored F32 weights")
+        with torch.device("meta"):
+            replacement = cls(module.in_features, module.out_features)
+        replacement.weight = module.weight
+        replacement.train(module.training)
+        return replacement
+
+    @torch.inference_mode()
+    def forward(self, inputs):
+        import time
+        require(inputs.dtype == self.weight.dtype == torch.float32 and self.bias is None, "candidate Linear forbids dtype fallback/bias")
+        require(inputs.shape[-1] == self.in_features and inputs.device == self.weight.device, "candidate Linear input geometry/device mismatch")
+        started = time.perf_counter()
+        shape = (*inputs.shape[:-1], self.out_features)
+        output = torch.empty(shape, dtype=torch.float32, device=inputs.device)
+        inputs64 = inputs.double()
+        positions = inputs.numel() // self.in_features
+        for start in range(0, self.out_features, F64_LINEAR_ROW_CHUNK):
+            end = min(start + F64_LINEAR_ROW_CHUNK, self.out_features)
+            weight64 = self.weight[start:end].double()
+            result64 = torch.nn.functional.linear(inputs64, weight64, None)
+            require(torch.isfinite(result64).all().item(), "non-finite candidate Linear result")
+            result32 = result64.float()
+            require(torch.isfinite(result32).all().item(), "non-finite candidate F32 output")
+            output[..., start:end].copy_(result32)
+            f64_bytes = inputs64.numel() * 8 + weight64.numel() * 8 + result64.numel() * 8
+            working_bytes = f64_bytes + (positions * self.out_features + result32.numel()) * 4
+            self.peak_f64_temporary_bytes = max(self.peak_f64_temporary_bytes, f64_bytes)
+            self.peak_working_bytes = max(self.peak_working_bytes, working_bytes)
+            del weight64, result64, result32
+        require(output.dtype == torch.float32 and output.shape == shape, "candidate Linear changed output boundary")
+        self.calls += 1
+        self.elapsed_seconds += time.perf_counter() - started
+        return output
+
+
 class ExactCovariantNorm(LlamaRMSNorm):
     def __init__(self, d, eps, p, q):
         super().__init__(d, eps)

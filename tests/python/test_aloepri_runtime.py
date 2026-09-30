@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "demo"))
 import aloepri_runtime as runtime
 import hidden_expansion_demo as demo
+import keymat_numerical_diagnostics as diagnostic
 
 
 class RuntimeTests(unittest.TestCase):
@@ -95,6 +96,10 @@ class RuntimeTests(unittest.TestCase):
             with patch.object(LlamaForCausalLM, "from_pretrained", side_effect=AssertionError("source loading forbidden")):
                 loaded, _, _ = runtime.load_runtime(self.artifact, self.secret)
                 self.assertEqual(tuple(loaded(input_ids=torch.tensor([[1, 4]]), use_cache=False).logits.shape), (1, 2, 19))
+                for member in ["gate_proj", "up_proj", "down_proj"]:
+                    setattr(loaded.model.layers[0].mlp, member, runtime.F64AccumLinear.from_linear(getattr(loaded.model.layers[0].mlp, member)))
+                nodes, _ = diagnostic.trace_first_block(loaded, [1, 4])
+                self.assertTrue(all(value.dtype == torch.float32 and value.shape[-1] == 12 for value in nodes.values()))
             result = subprocess.run([sys.executable, str(ROOT / "demo" / "aloepri_runtime.py"), "--artifact", str(self.artifact), "--secret", str(self.secret), "--token-ids", "1", "4"], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(json.loads(result.stdout)["finite_logits"])
@@ -173,6 +178,93 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(report["G2"]["status"], "pass")
         self.assertEqual(report["G3"]["status"], "fail")
         self.assertEqual(report["G4"]["status"], "not_run")
+
+    def test_f64_candidate_preserves_f32_state_and_chunked_boundaries(self):
+        original = torch.nn.Linear(5, runtime.F64_LINEAR_ROW_CHUNK + 7, bias=False).eval()
+        before = original.weight.detach().clone()
+        candidate = runtime.F64AccumLinear.from_linear(original)
+        self.assertIs(candidate.weight, original.weight)
+        candidate.load_state_dict(original.state_dict(), strict=True, assign=True)
+        self.assertEqual(set(candidate.state_dict()), {"weight"})
+        self.assertTrue(torch.equal(before, candidate.weight))
+        for shape in [(5,), (2, 5), (2, 3, 5)]:
+            inputs = torch.randn(shape)
+            expected = torch.nn.functional.linear(inputs.double(), before.double()).float()
+            actual = candidate(inputs)
+            self.assertTrue(torch.equal(actual, expected))
+            self.assertEqual(actual.dtype, torch.float32)
+            self.assertEqual(actual.shape[-1], original.out_features)
+        self.assertEqual(candidate.weight.dtype, torch.float32)
+        self.assertFalse(any(value.dtype == torch.float64 for value in candidate.state_dict().values()))
+        self.assertGreater(candidate.peak_f64_temporary_bytes, 0)
+        self.assertFalse(list(candidate.buffers()))
+        with self.assertRaises(ValueError):
+            candidate(torch.randn(2, 5, dtype=torch.float64))
+        with self.assertRaises(ValueError):
+            candidate(torch.full((2, 5), float("nan")))
+        with self.assertRaises(ValueError):
+            runtime.F64AccumLinear(5, 7, bias=True)
+        with self.assertRaises(ValueError):
+            runtime.F64AccumLinear.from_linear(torch.nn.Linear(5, 7, dtype=torch.float64, bias=False))
+
+    def test_candidate_requires_every_local_sequence_and_f32_constraint(self):
+        profile = {"state": {"parameters_f32": True, "state_dict_f32": True, "physical_head_independent": True},
+                   "weight_bits_unchanged": True, "prompts": [{"status": "pass"}] * 3}
+        self.assertTrue(diagnostic.local_candidate_passes(profile))
+        failed = copy.deepcopy(profile)
+        failed["prompts"][2]["status"] = "fail"
+        self.assertFalse(diagnostic.local_candidate_passes(failed))
+        failed = copy.deepcopy(profile)
+        failed["state"]["state_dict_f32"] = False
+        self.assertFalse(diagnostic.local_candidate_passes(failed))
+        original = demo.trace
+        def failing_later_trace(model, ids):
+            nodes, logits = original(model, ids)
+            if model is self.model:
+                nodes["layer.1.input_norm"] = torch.full_like(nodes["layer.1.input_norm"], float("nan"))
+            return nodes, logits
+        with patch.object(demo, "trace", side_effect=failing_later_trace), patch.object(demo, "cache_logits", side_effect=AssertionError("G3 must not run")), patch.object(demo, "greedy", side_effect=AssertionError("G4 must not run")):
+            report = demo.run_gates(self.baseline, self.model, self.q, self.diagnostics, self.fixture)
+        self.assertEqual(report["G2"]["first_failure"]["node"], "layer.1.input_norm")
+        self.assertEqual(report["G3"]["status"], "not_run")
+        self.assertEqual(report["G4"]["status"], "not_run")
+
+    def test_error_vectors_reconstruct_without_adding_scalar_maxima(self):
+        a = torch.tensor([1.0, -2.0], dtype=torch.float64)
+        b = a + torch.tensor([3.0, -4.0], dtype=torch.float64)
+        c = a + torch.tensor([0.01, -0.02], dtype=torch.float64)
+        report, vectors = diagnostic.difference_chain({"origin": a, "first": b, "last": c})
+        self.assertTrue(torch.allclose(sum(vectors.values()), c - a, atol=1e-15, rtol=0))
+        self.assertLess(report["reconstruction_max_abs"], 1e-15)
+        scalar_sum = sum(item["max_abs"] for item in report["components"].values())
+        self.assertGreater(scalar_sum, report["total"]["max_abs"])
+        zero = torch.tensor([0.0, -0.0])
+        self.assertEqual(diagnostic.ulp_distance(zero, -zero)["max_ulp"], 0)
+        value = torch.tensor([-1.0, 1.0])
+        adjacent = torch.nextafter(value, torch.full_like(value, float("inf")))
+        self.assertEqual(diagnostic.ulp_distance(value, adjacent)["max_ulp"], 1)
+
+    def test_first_block_oracle_and_same_input_counterfactual_chains(self):
+        ids = self.fixture["prompts"][0] + self.fixture["continuation_ids"]
+        baseline, base_internal = diagnostic.trace_first_block(self.baseline, ids)
+        expanded, internal = diagnostic.trace_first_block(self.model, ids)
+        self.assertEqual(list(baseline)[-1], "layer.0.block_output")
+        self.assertEqual(len(baseline), 8)
+        self.assertTrue(torch.equal(internal["product"], internal["down_input"]))
+        p = self.model.model.norm._p
+        weights, theory = diagnostic.weight_oracle(self.baseline, self.model, p, self.q)
+        self.assertTrue(all(item["f32_encoding"]["max_abs"] < 1e-6 for item in weights.values()))
+        for name in ["gate_proj", "up_proj"]:
+            chain, vectors = diagnostic.input_linear_chain(baseline["layer.0.post_attention_norm"], expanded["layer.0.post_attention_norm"],
+                getattr(self.baseline.model.layers[0].mlp, name).weight, getattr(self.model.model.layers[0].mlp, name).weight, theory[name], p)
+            self.assertLess(chain["reconstruction_max_abs"], 1e-12)
+            self.assertLess(chain["components"]["covariance64"]["max_abs"], 1e-12)
+        chain, vectors = diagnostic.down_linear_chain(base_internal["down_input"], internal["down_input"],
+            self.baseline.model.layers[0].mlp.down_proj.weight, self.model.model.layers[0].mlp.down_proj.weight, theory["down_proj"], self.q)
+        self.assertLess(chain["reconstruction_max_abs"], 1e-12)
+        recovered_error = expanded["layer.0.ffn_output"].double() @ self.q - baseline["layer.0.ffn_output"].double()
+        self.assertTrue(torch.allclose(sum(vectors.values()), recovered_error, atol=1e-12, rtol=0))
+        self.assertTrue(diagnostic.state_summary(self.model, 12)["state_dict_f32"])
 
     def test_generation_edges_and_strict_metrics(self):
         class Fixed:

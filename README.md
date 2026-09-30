@@ -176,3 +176,48 @@ independent greedy sequences. Failed upstream gates leave downstream gates
 `not_run`; a G2/G3 failure is not evidence that Phase 3B is complete. Standalone
 runtime inference is diagnostic, not an equivalence claim. Do not alter fixture
 parameters or thresholds to make a failed report pass.
+
+### Bounded numerical diagnostics — still blocked
+
+The original native-runtime failure at commit `8fdd8c9` is retained. The fixed
+three-sequence fixture first fails at `layer.0.ffn_output` (max errors
+7.1695e-5 / 8.3798e-5 / 6.9545e-5). G1/structure passing does not repair G2.
+
+`demo/keymat_numerical_diagnostics.py` stops after the first block and checks the
+complete gate/up/down weights, SwiGLU hooks and same-input counterfactuals. The
+F64 SOURCE/theoretical-weight references are **diagnostic_only**, never runtime
+substitutes or formal gate evidence. Error vectors stay in a private 0600 file;
+the public JSON contains only summaries, identities and code/environment hashes.
+
+```bash
+HF_HUB_OFFLINE=1 python demo/keymat_numerical_diagnostics.py \
+  --source SOURCE_F32 --artifact OUTPUT_KEYMAT \
+  --secret PRIVATE_DIR/keymat-secret.json \
+  --fixture demo/hidden_expansion_fixture.json --failure-report ORIGINAL_GATES_JSON \
+  --report numerical-diagnostics.json \
+  --private-error-vectors PRIVATE_DIR/diagnostic-errors.pt
+HF_HUB_OFFLINE=1 python demo/keymat_numerical_diagnostics.py \
+  --source SOURCE_F32 --artifact OUTPUT_KEYMAT \
+  --secret PRIVATE_DIR/keymat-secret.json \
+  --fixture demo/hidden_expansion_fixture.json --failure-report ORIGINAL_GATES_JSON \
+  --diagnostic-input numerical-diagnostics.json --evaluate-candidate \
+  --report candidate-local.json
+```
+
+The single approved candidate, `F64AccumLinear`, keeps parameters/state, inputs
+and outputs F32 and uses only temporary F64 calculation. Output rows are
+chunked at a fixed 1024, including head-sized test cases; it never stores a
+persistent F64 shadow model. Reports count temporary tensors and time separately
+from cumulative process RSS (which includes baseline/runtime/oracles).
+
+Native, down-only, and gate/up/down controls use the same artifact and fixture.
+The all-FFN candidate still fails locally: FFN max errors
+6.5052e-5 / 8.0413e-5 / 5.4939e-5 exceed 1e-5. Its largest per-Linear F64 temporary
+working set is 8073216 bytes (8134656 including F32 outputs/scratch), not a
+compiler memory-limit claim. This is not a production optimization.
+
+**Default loader/normal inference remains native F32 Linear.** The candidate is
+not installed across the model: its prerequisite local gate failed, so candidate
+full-model G2/G3/G4 are `not_run`. No source, Secret, artifact/schema, norm,
+fixture or tolerance was changed. These results neither prove all F32 strategies
+impossible nor authorize relaxing the gate; further changes require a new plan.
