@@ -44,7 +44,9 @@ pub fn verify_artifact(root: &Path) -> Result<VerificationOutcome> {
         });
     };
     match manifest.artifact_version {
-        SCHEMA_VERSION => verify_current(&artifact, &manifest, fingerprint),
+        SCHEMA_VERSION | aloepri_core::keymat::KEYMAT_SCHEMA_VERSION => {
+            verify_current(&artifact, &manifest, fingerprint)
+        }
         MANIFEST_VERSION | TOKEN_MANIFEST_VERSION => {
             verify_legacy(&artifact, &manifest, fingerprint)
         }
@@ -138,7 +140,7 @@ fn verify_current(
         plan_verified: true,
         standard_hf_checkpoint: Some(runtime.standard_hf_checkpoint),
         runtime_required: !runtime.standard_hf_checkpoint,
-        verification_scope: "v3_contract".into(),
+        verification_scope: format!("v{}_contract", plan.version),
         semantic_verification: "not_run".into(),
         runtime_contract: Some(runtime.clone()),
         tensor_count: artifact.tensors().len(),

@@ -1,3 +1,5 @@
+pub mod keymat;
+
 use aloepri_core::{
     error::{CompilerError, Result, io_error, json_error},
     plan::{MethodContract, SecretBinding},
@@ -251,6 +253,7 @@ impl ClientSecret {
 pub fn validate_v0_1_boundary(config: &aloepri_core::TransformConfig) -> Result<()> {
     if config.method != MethodContract::identity()
         && config.method != MethodContract::aloepri_token()
+        && config.method != MethodContract::aloepri_keymat()
     {
         return Err(CompilerError::Unsupported(format!(
             "unsupported method {}/{}",

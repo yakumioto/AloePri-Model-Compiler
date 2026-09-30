@@ -25,6 +25,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - run: cargo build --locked -p aloepri-cli
       - run: python -m pip install -r demo/requirements.txt
-      - run: python -m py_compile demo/token_permutation_demo.py tests/reference/identity_oracle.py tests/python/test_token_permutation_demo.py
+      - run: python -m py_compile demo/*.py scripts/keymat_memory_smoke.py tests/reference/identity_oracle.py tests/python/*.py
       - run: python -m unittest discover -s tests/python -p 'test_*.py'

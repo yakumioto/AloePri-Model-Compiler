@@ -5,7 +5,7 @@ The workspace has six crates with one-way dependencies:
 ```text
 aloepri-cli -> aloepri-artifact -> aloepri-core
             -> aloepri-architecture -> aloepri-core
-            -> aloepri-transform -> aloepri-core
+            -> aloepri-transform -> aloepri-secret -> aloepri-core
             -> aloepri-secret -> aloepri-core
 ```
 
@@ -55,9 +55,9 @@ one producer, and each descriptor is internally consistent; method-specific
 rules (name/shape preservation for identity and token, padding geometry for the
 diagnostic method) live in the method validator.
 
-Two copies of a source are still rejected, as are duplicate or unproduced
-outputs, unknown inputs, forged input metadata, forward/self/unknown
-dependencies, and descriptor/layout mismatches.
+Distinct outputs may consume the same source (KeyMat EP and EQ^T). Duplicate or
+unproduced outputs, unknown inputs, forged input metadata, forward/self/unknown
+dependencies, and descriptor/layout mismatches are rejected.
 
 ## Writer, sinks and bounded memory
 
@@ -117,3 +117,30 @@ after every operation, so resume is chosen from what staging holds. The
 compiler validates the full checkpoint contract—including method, runtime
 contract, layout and `secret_id`—before creating the staging directory, taking
 the lock, or opening a writer.
+
+## KeyMat boundary and memory lifecycle
+
+KeyMat mathematical generation and private bundle persistence live in
+`aloepri-secret`. Core owns checked public parameters, geometry and estimates;
+architecture maps exact Llama tensor roles; transform borrows one Arc of key
+material. Public `KeyMatRight`/`KeyMatLeft` operations carry roles only.
+Output-driven layout, sinks, completion-prefix checkpoints and publication
+are the existing pipeline, including the additional physical tied head.
+
+Before allocation, the CLI checks conservative generation peak
+`512*D^2 + 16*d*D + 128KiB`, covering bases/QR/SVD/products/diagnostics and the
+canonical matrices. Execution separately reserves metadata and resident
+`16*d*D` F64 keys before staging/lock/writer. Tiles reserve source bytes,
+F64 accumulators and F32 encoding together. The sequential kernel visits output
+row, column tile and reduction tile: right coefficients are P[k,j]/Q[j,k],
+left coefficients P[k,i]. Reads can be smaller than a source/output row; no
+model tensor is materialized or temporarily written elsewhere. RSS smoke uses
+real F32 right/left operations, not the identity U8 fixture.
+
+Python runtime builds the pinned logical Llama on meta, installs physical
+boundary modules and exact_covariant norms, then strictly loads only transformed
+safetensors. Shared private P/Q buffers are nonpersistent. It keeps logical
+Attention/RoPE/MLP/cache and independent physical embedding/head parameters.
+The layerwise harness uses forward hooks, a separately loaded baseline and
+fixed teacher-forced continuations; it never drives runtime greedy with
+baseline-selected tokens or upgrades structural verification into equivalence.

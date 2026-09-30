@@ -1,8 +1,8 @@
 # AloePri Model Compiler
 
 A local Rust compiler for Hugging Face safetensors artifacts. The compiler
-supports the byte-preserving `identity` method and the first weight-changing
-`aloepri-token` vocabulary permutation for dense Llama checkpoints.
+supports byte-preserving `identity`, `aloepri-token` vocabulary permutation,
+and experimental F32 `aloepri-keymat` hidden expansion for dense Llama checkpoints.
 
 ## Scope
 
@@ -25,8 +25,8 @@ non-standard artifact declares `standard_hf_checkpoint = false` and is reported
 as requiring its own runtime: `aloepri verify` never presents it as loadable by
 vanilla Transformers, and it performs structural verification only.
 
-The compiler does not download models, implement Attention/FFN/RoPE transforms,
-quantization, hidden-state obfuscation, or claim cryptographic weight secrecy.
+The compiler does not download models, implement paper Attention/FFN/RoPE
+transforms or quantization, or claim cryptographic privacy or weight secrecy.
 The Client Secret is an external file and must be supplied to the client-side
 inference demo.
 
@@ -82,7 +82,7 @@ aloepri verify MODEL
 new external `--secret-output` path. A resumed token transform reads and
 validates the existing Secret and never generates a replacement.
 
-`aloepri verify` prints a layered report: structure, manifest, v3 plan
+`aloepri verify` prints a layered report: structure, manifest, versioned plan
 verification, the declared `standard_hf_checkpoint` flag, `runtime_required`,
 and `semantic_verification: not_run`. A non-standard artifact verifies
 structurally and is reported as requiring its runtime; it is never described as
@@ -99,9 +99,9 @@ directory, verifies the candidate from disk, and publishes it with a Linux
 `renameat2(RENAME_NOREPLACE)` operation. Existing output is never overwritten.
 Resume refuses any checkpoint whose source fingerprint, method, runtime
 contract, layout, plan hash or secret does not match the current plan, before
-staging is touched. Manifest, checkpoint and plan are schema version 3; legacy
-v1/v2 artifacts remain readable for structural verification only and are never
-resumed or upgraded.
+staging is touched. Identity/token/diagnostic use schema v3; KeyMat uses v4.
+Legacy v1/v2 artifacts remain readable for structural verification only and are
+never resumed or upgraded.
 
 ## Token permutation demo
 
@@ -122,3 +122,57 @@ relationships, tied embedding loading, teacher-forced logits, and restored
 greedy token IDs before printing `Baseline`, `AloePri`, and `Equivalent: true`.
 See `docs/architecture.md`, `docs/artifact-format.md`, and
 `docs/method-contract.md` for the stable contracts.
+
+## Experimental KeyMat correctness runtime
+
+`aloepri-keymat/0.1` implements Algorithm 1 in F64 and transforms **F32-only**
+dense Llama weights into `D=d+2h`. `h` must be positive and even; lambda must be
+finite and nonnegative. F16/BF16/quantized weights, biases and unknown tensor
+variants are rejected. The logical config stays unchanged. In particular, a
+missing tied head is materialized independently: embedding `EP` and head
+`EQ^T` cannot share physical storage.
+
+`demo/aloepri_runtime.py` is an **exact_covariant diagnostic correctness oracle**,
+not the final AloePri paper runtime or a privacy guarantee. Only RMSNorm
+explicitly uses `z -> zQ -> RMSNorm_d -> P`; residuals remain D-dimensional,
+Attention/RoPE/SwiGLU remain logical, and KV cache is standard projection-space.
+Loading requires transformed artifact + external Secret; never load this
+artifact with `AutoModelForCausalLM.from_pretrained()`.
+
+Install `demo/requirements.txt`. Prepare the fixed local model revision in
+`demo/hidden_expansion_fixture.json` as a separate F32 source (this is not
+compiler dtype conversion), then run:
+
+```bash
+HF_HUB_OFFLINE=1 python demo/prepare_f32_fixture.py \
+  --source LOCAL_SMOLLM2_SNAPSHOT --output SOURCE_F32 --report export.json
+mkdir PRIVATE_DIR
+aloepri transform SOURCE_F32 --output OUTPUT_KEYMAT \
+  --method aloepri-keymat --expansion-size 32 --keymat-lambda 0.3 \
+  --keymat-fixture-seed 20260930 --secret-output PRIVATE_DIR/keymat-secret.json \
+  --memory-limit 256MiB --max-shard-size 32MiB
+aloepri verify OUTPUT_KEYMAT
+HF_HUB_OFFLINE=1 python demo/hidden_expansion_demo.py \
+  --source SOURCE_F32 --artifact OUTPUT_KEYMAT \
+  --secret PRIVATE_DIR/keymat-secret.json \
+  --fixture demo/hidden_expansion_fixture.json --report gates.json
+HF_HUB_OFFLINE=1 python demo/aloepri_runtime.py \
+  --artifact OUTPUT_KEYMAT --secret PRIVATE_DIR/keymat-secret.json \
+  --token-ids 6403 1980 253 655 --max-new-tokens 0
+python scripts/keymat_memory_smoke.py \
+  --binary target/release/aloepri --report memory.json
+python -m unittest discover -s tests/python -p 'test_*.py'
+```
+
+The fixture seed is for reproducible testing only; omit it for OS-random private
+production material. Private JSON and `key-material.bin` must both live outside
+source/output/staging. Neither is included in the published artifact. Reuse the
+same bundle and parameters with `--resume`; incomplete bundles are never
+repaired or overwritten automatically.
+
+The harness freezes finite + **max_abs<=1e-5**, with no relative-tolerance escape.
+It compares every specified layer node, full/prefill/cached decode logits and
+independent greedy sequences. Failed upstream gates leave downstream gates
+`not_run`; a G2/G3 failure is not evidence that Phase 3B is complete. Standalone
+runtime inference is diagnostic, not an equivalence claim. Do not alter fixture
+parameters or thresholds to make a failed report pass.

@@ -8,4 +8,5 @@ authors.workspace = true
 
 [dependencies]
 aloepri-core.workspace = true
+aloepri-secret.workspace = true
 blake3.workspace = true

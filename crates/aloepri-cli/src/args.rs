@@ -45,6 +45,15 @@ pub struct TransformArgs {
     pub method: Option<String>,
     #[arg(long)]
     pub secret_output: Option<PathBuf>,
+    #[arg(long)]
+    pub expansion_size: Option<u64>,
+    #[arg(long, allow_hyphen_values = true)]
+    pub keymat_lambda: Option<f64>,
+    #[arg(
+        long,
+        help = "Deterministic fixture seed; never use for private production keys"
+    )]
+    pub keymat_fixture_seed: Option<u64>,
     #[arg(long, default_value = "256MiB", value_parser = parse_size)]
     pub memory_limit: u64,
     #[arg(long, default_value = "4GiB", value_parser = parse_size)]
@@ -90,6 +99,7 @@ pub fn resolve_method(
     match (identity, method) {
         (true, None) | (false, Some("identity")) => Ok(aloepri_core::MethodContract::identity()),
         (false, Some("aloepri-token")) => Ok(aloepri_core::MethodContract::aloepri_token()),
+        (false, Some("aloepri-keymat")) => Ok(aloepri_core::MethodContract::aloepri_keymat()),
         (false, Some(other)) => Err(anyhow!("unsupported transform method {other}")),
         (false, None) => Err(anyhow!("an explicit --identity or --method is required")),
         (true, Some(_)) => unreachable!("method conflict is checked above"),

@@ -98,7 +98,7 @@ impl Manifest {
             MANIFEST_VERSION | TOKEN_MANIFEST_VERSION => {
                 manifest.validate_legacy(&path)?;
             }
-            SCHEMA_VERSION => {
+            SCHEMA_VERSION | aloepri_core::keymat::KEYMAT_SCHEMA_VERSION => {
                 manifest.validate_current(&path)?;
             }
             version => {

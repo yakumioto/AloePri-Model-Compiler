@@ -217,6 +217,9 @@ impl ArchitectureAdapter for LlamaDenseAdapter {
         artifact: &dyn ModelArtifact,
         config: &TransformConfig,
     ) -> Result<PlanDraft> {
+        if config.method == aloepri_core::MethodContract::aloepri_keymat() {
+            return build_keymat_plan(artifact, config);
+        }
         let identity = config.method == aloepri_core::MethodContract::identity();
         let token = config.method == aloepri_core::MethodContract::aloepri_token();
         if !identity && !token {
@@ -262,6 +265,90 @@ impl ArchitectureAdapter for LlamaDenseAdapter {
             operations,
         })
     }
+}
+
+pub fn validate_keymat_source(artifact: &dyn ModelArtifact) -> Result<()> {
+    LlamaDenseAdapter::validate_schema(artifact, true)?;
+    let d = required_u64(artifact.config(), "hidden_size")?;
+    let specs = aloepri_core::keymat::tensor_specs(&logical_dimensions(artifact), d)?;
+    if ["attention_bias", "mlp_bias"]
+        .iter()
+        .any(|k| artifact.config().get(k).and_then(Value::as_bool) == Some(true))
+    {
+        return Err(CompilerError::Unsupported(
+            "KeyMat does not support biases".into(),
+        ));
+    }
+    for tensor in artifact.tensors() {
+        if tensor.dtype != DType::F32 || !specs.contains_key(tensor.name.as_str()) {
+            return Err(CompilerError::Unsupported(
+                "KeyMat requires known dense Llama F32 weights without bias or quantization".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_keymat_plan(artifact: &dyn ModelArtifact, config: &TransformConfig) -> Result<PlanDraft> {
+    validate_keymat_source(artifact)?;
+    let binding = config
+        .keymat_binding
+        .as_ref()
+        .ok_or_else(|| CompilerError::InvalidPlan {
+            reason: "KeyMat needs a secret binding".into(),
+        })?;
+    binding.validate()?;
+    let logical = logical_dimensions(artifact);
+    let specs = aloepri_core::keymat::tensor_specs(&logical, binding.physical_hidden_size)?;
+    let mut operations = Vec::new();
+    for (index, (name, (_, shape, kind))) in specs.into_iter().enumerate() {
+        let output_name = TensorName::try_from(name.as_str())?;
+        let input = artifact
+            .model_spec()
+            .tensor(&output_name)
+            .or_else(|| {
+                (name == "lm_head.weight")
+                    .then(|| {
+                        artifact.model_spec().tensor(
+                            &TensorName::try_from("model.embed_tokens.weight")
+                                .expect("static name"),
+                        )
+                    })
+                    .flatten()
+            })
+            .ok_or_else(|| CompilerError::MissingTensor { name: name.clone() })?;
+        let mut descriptor: aloepri_core::OutputTensorDescriptor = input.into();
+        descriptor.name = output_name;
+        descriptor.shape = aloepri_core::TensorShape::new(shape);
+        descriptor.byte_length = descriptor.expected_byte_length()?;
+        operations.push(Operation {
+            id: aloepri_core::OperationId(index as u32),
+            kind,
+            inputs: vec![OperationInput {
+                descriptor: input.clone(),
+            }],
+            output: OperationOutput { descriptor },
+            memory_requirement: ByteLength(16),
+            dependencies: vec![],
+        });
+    }
+    let mut physical = logical.clone();
+    physical.insert("hidden_size".into(), binding.physical_hidden_size);
+    Ok(PlanDraft {
+        architecture: "llama".into(),
+        operations,
+        runtime_contract: RuntimeContract {
+            id: "aloepri".into(),
+            version: "1".into(),
+            standard_hf_checkpoint: false,
+            architecture: "llama".into(),
+            logical_dimensions: logical,
+            physical_dimensions: physical,
+            expansion_size: Some(binding.expansion_size),
+            norm_mode: Some("exact_covariant".into()),
+            kv_cache_format: Some("standard_projection_v1".into()),
+        },
+    })
 }
 
 fn bounded_chunk(length: u64) -> u64 {

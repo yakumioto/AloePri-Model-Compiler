@@ -28,6 +28,13 @@ impl MethodContract {
         }
     }
 
+    pub fn aloepri_keymat() -> Self {
+        Self {
+            id: "aloepri-keymat".into(),
+            version: "0.1".into(),
+        }
+    }
+
     pub fn aloepri_token() -> Self {
         Self {
             id: "aloepri-token".into(),
@@ -60,6 +67,10 @@ pub struct RuntimeContract {
     pub physical_dimensions: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expansion_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_format: Option<String>,
 }
 
 impl RuntimeContract {
@@ -75,6 +86,8 @@ impl RuntimeContract {
             physical_dimensions: logical_dimensions.clone(),
             logical_dimensions,
             expansion_size: None,
+            norm_mode: None,
+            kv_cache_format: None,
         }
     }
 }
@@ -95,6 +108,8 @@ pub struct TransformConfig {
     pub workers: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_binding: Option<SecretBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keymat_binding: Option<crate::keymat::KeyMatBinding>,
 }
 
 impl Default for TransformConfig {
@@ -106,6 +121,7 @@ impl Default for TransformConfig {
             max_shard_size: ByteLength(4 * 1024 * 1024 * 1024),
             workers: 1,
             secret_binding: None,
+            keymat_binding: None,
         }
     }
 }
@@ -135,6 +151,18 @@ pub enum OperationKind {
     /// `additional_columns` zero elements. Diagnostic method only.
     #[serde(rename = "pad_columns")]
     PadColumns { additional_columns: u64 },
+    #[serde(rename = "keymat_right")]
+    KeyMatRight { role: KeyMatRole },
+    #[serde(rename = "keymat_left")]
+    KeyMatLeft { role: KeyMatRole },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum KeyMatRole {
+    EmbeddingP,
+    InputQTranspose,
+    HeadQTranspose,
+    OutputPTranspose,
 }
 
 impl OperationKind {
@@ -234,6 +262,8 @@ pub struct TransformPlan {
     pub runtime_contract: RuntimeContract,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keymat_binding: Option<crate::keymat::KeyMatBinding>,
     pub architecture: String,
     pub operations: Vec<Operation>,
     pub output_layout: OutputLayout,
@@ -262,13 +292,34 @@ impl TransformPlan {
         let is_identity = config.method == MethodContract::identity();
         let is_token = config.method == MethodContract::aloepri_token();
         let is_expand = config.method == MethodContract::expand_test();
-        if !is_identity && !is_token && !is_expand {
+        let is_keymat = config.method == MethodContract::aloepri_keymat();
+        if !is_identity && !is_token && !is_expand && !is_keymat {
             return Err(CompilerError::Unsupported(format!(
                 "unsupported method {}/{}",
                 config.method.id, config.method.version
             )));
         }
-        let secret_id = if is_token {
+        if !is_keymat && config.keymat_binding.is_some() {
+            return Err(CompilerError::InvalidPlan {
+                reason: "only KeyMat accepts a KeyMat binding".into(),
+            });
+        }
+        let secret_id = if is_keymat {
+            let binding =
+                config
+                    .keymat_binding
+                    .as_ref()
+                    .ok_or_else(|| CompilerError::InvalidPlan {
+                        reason: "KeyMat requires a secret binding".into(),
+                    })?;
+            binding.validate()?;
+            if binding.source_fingerprint != source_fingerprint || config.secret_binding.is_some() {
+                return Err(CompilerError::InvalidPlan {
+                    reason: "KeyMat source or secret binding mismatch".into(),
+                });
+            }
+            Some(binding.secret_id.clone())
+        } else if is_token {
             let binding =
                 config
                     .secret_binding
@@ -356,7 +407,12 @@ impl TransformPlan {
                 })?;
 
         let mut plan = Self {
-            version: SCHEMA_VERSION,
+            version: if is_keymat {
+                crate::keymat::KEYMAT_SCHEMA_VERSION
+            } else {
+                SCHEMA_VERSION
+            },
+            keymat_binding: config.keymat_binding.clone(),
             source_fingerprint,
             source_inventory,
             output_inventory,
@@ -376,13 +432,46 @@ impl TransformPlan {
             },
             plan_hash: ModelFingerprint::from_digest(blake3::hash(b"uninitialized")),
         };
+        if let Some(binding) = &config.keymat_binding {
+            let state =
+                crate::keymat::method_state_bytes(binding.hidden_size, binding.expansion_size)?;
+            let resident =
+                metadata_bytes
+                    .checked_add(state)
+                    .ok_or(CompilerError::ArithmeticOverflow {
+                        operation: "KeyMat resident memory",
+                    })?;
+            let available = config
+                .memory_limit
+                .0
+                .checked_sub(resident)
+                .filter(|n| *n >= 16)
+                .ok_or(CompilerError::MemoryLimitExceeded {
+                    requested: resident.saturating_add(16),
+                    available: config.memory_limit.0,
+                })?;
+            let tile = available.min(4 * 1024 * 1024) / 16;
+            plan.memory_estimate = MemoryEstimate {
+                metadata_bytes: ByteLength(metadata_bytes),
+                method_state_bytes: ByteLength(state),
+                input_buffer_bytes: ByteLength(tile * 4),
+                output_buffer_bytes: ByteLength(tile * 4),
+                transform_scratch_bytes: ByteLength(tile * 8),
+                peak_bytes: ByteLength(resident + tile * 16),
+            };
+        }
         plan.validate()?;
         plan.plan_hash = plan.compute_hash()?;
         Ok(plan)
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.version != SCHEMA_VERSION {
+        let expected_version = if self.method == MethodContract::aloepri_keymat() {
+            crate::keymat::KEYMAT_SCHEMA_VERSION
+        } else {
+            SCHEMA_VERSION
+        };
+        if self.version != expected_version {
             return Err(CompilerError::UnsupportedVersion {
                 version: self.version,
             });
@@ -521,6 +610,19 @@ impl TransformPlan {
         let identity = self.method == MethodContract::identity();
         let token = self.method == MethodContract::aloepri_token();
         let expand = self.method == MethodContract::expand_test();
+        let keymat = self.method == MethodContract::aloepri_keymat();
+        if !keymat
+            && (self.keymat_binding.is_some()
+                || runtime.norm_mode.is_some()
+                || runtime.kv_cache_format.is_some())
+        {
+            return Err(CompilerError::InvalidPlan {
+                reason: "KeyMat fields require KeyMat method".into(),
+            });
+        }
+        if keymat {
+            return crate::keymat::validate_plan(self);
+        }
         if !identity && !token && !expand {
             return Err(CompilerError::Unsupported(format!(
                 "unsupported method {}/{}",
@@ -584,6 +686,9 @@ impl TransformPlan {
     fn validate_method_operations(&self) -> Result<()> {
         let identity = self.method == MethodContract::identity();
         let token = self.method == MethodContract::aloepri_token();
+        if self.method == MethodContract::aloepri_keymat() {
+            return Ok(());
+        }
         for operation in &self.operations {
             let input = &operation.inputs[0].descriptor;
             let output = &operation.output.descriptor;
@@ -620,6 +725,11 @@ impl TransformPlan {
                             ),
                         });
                     }
+                }
+                OperationKind::KeyMatRight { .. } | OperationKind::KeyMatLeft { .. } => {
+                    return Err(CompilerError::InvalidPlan {
+                        reason: "KeyMat operation requires KeyMat method".into(),
+                    });
                 }
                 OperationKind::PadColumns { additional_columns } => {
                     if identity || token {
@@ -883,6 +993,14 @@ mod tests {
         .unwrap();
         assert_eq!(first.plan_hash, second.plan_hash);
         assert_eq!(first.version, SCHEMA_VERSION);
+        assert_eq!(
+            first.plan_hash.to_string(),
+            "9e235b1c2e5a9106d67fd79e6487552a9f95419d4bbe151fb9c84c72676f8649"
+        );
+        let encoded = serde_json::to_string(&first).unwrap();
+        for field in ["keymat_binding", "norm_mode", "kv_cache_format"] {
+            assert!(!encoded.contains(field));
+        }
         first.verify_hash().unwrap();
     }
 

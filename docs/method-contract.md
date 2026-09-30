@@ -1,13 +1,14 @@
 # Method contract
 
-The product CLI exposes two method contracts:
+The product CLI exposes three method contracts:
 
 ```json
 {"id":"identity","version":"0.1"}
 {"id":"aloepri-token","version":"0.1"}
+{"id":"aloepri-keymat","version":"0.1"}
 ```
 
-A third contract, `{"id":"expand-test","version":"0.1"}`, exists only so the
+A diagnostic contract, `{"id":"expand-test","version":"0.1"}`, exists only so the
 test suite can exercise a real shape-changing pipeline. It is never selectable
 from the CLI and is not an AloePri algorithm.
 
@@ -63,6 +64,44 @@ The Client Secret contains `version`, method, `secret_id`, `vocab_size`,
 versioned method, source fingerprint, vocabulary size, nonce, and both
 permutations. Loading validates the full bijection, inverse relationship,
 source binding, and commitment.
+
+## AloePri KeyMat (experimental Phase 3B)
+
+`aloepri-keymat/0.1` uses schema v4 and F32-only dense Llama, without bias or
+quantization. Algorithm `algorithm1-v1` constructs in F64:
+
+```text
+B = U + lambda V; E = E1 E2; F = F1 F2
+CF = 0; EN = 0; Z Z^T = I_D
+P = [B C E] Z                  # d x D
+Q = Z^T [B^-1; F; N]           # D x d
+PQ = BB^-1 + CF + EN = I_d     # not QP=I_D
+```
+
+U/Z use QR with R-diagonal sign correction, Gaussian substreams are fixed by
+`chacha20-rand0.9-normal0.5-v1`, and complete right nullspaces use bounded SVD
+with cutoff `max(1e-10,1e-10*sigma_max)`. Wide matrices are zero-row padded before
+SVD so the thin decomposition does not discard the nullspace. Singular B,
+nonconvergence, non-finite keys or PQ error above 1e-5 fail closed without
+resampling. Diagnostics include max/mean PQ error, Frobenius/spectral norms,
+P condition estimate and B condition estimate.
+
+With PyTorch row-vector weights: embedding uses EP; head/q/k/v/gate/up use
+WQ^T; o/down use P^TW. Norm weights remain logical `[d]`. A tied missing head
+has its own physical `EQ^T` producer, never an alias to EP. Runtime id/version
+are `aloepri/1`, with `norm_mode=exact_covariant`,
+`kv_cache_format=standard_projection_v1`, and `standard_hf_checkpoint=false`.
+Only physical hidden changes; config, heads/head_dim, RoPE and intermediate
+size remain logical. No Algorithm 2, paper RMSNorm kappa, FFN intermediate
+permutation/scaling, noise or token composition is implemented.
+
+The diagnostic norm is `RMSNorm_d(zQ)P`, with F64 mappings and original F32
+Llama norm. It is not the paper's norm or a security claim. The standalone
+loader accepts only transformed artifact and external Secret, validates their
+contracts/digests and never calls `from_pretrained` on transformed weights.
+G1–G4 equivalence is a separate fail-closed harness: absolute 1e-5, all specified
+nodes and full/prefill/decode logits; generation runs only after prior gates
+pass. Structural verification never supplies these numerical results.
 
 ## Verification layering
 
