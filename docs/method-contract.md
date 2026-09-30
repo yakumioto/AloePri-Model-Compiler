@@ -68,7 +68,7 @@ source binding, and commitment.
 ## AloePri KeyMat (experimental Phase 3B)
 
 `aloepri-keymat/0.1` uses schema v4 and F32-only dense Llama, without bias or
-quantization. Algorithm `algorithm1-v1` constructs in F64:
+quantization. Both supported Algorithm 1 versions construct in F64:
 
 ```text
 B = U + lambda V; E = E1 E2; F = F1 F2
@@ -85,6 +85,23 @@ SVD so the thin decomposition does not discard the nullspace. Singular B,
 nonconvergence, non-finite keys or PQ error above 1e-5 fail closed without
 resampling. Diagnostics include max/mean PQ error, Frobenius/spectral norms,
 P condition estimate and B condition estimate.
+
+`algorithm1-v1` remains the default and preserves its original draws, bytes and
+identity semantics. `algorithm1-balanced-null-v2` is a fixed engineering variant:
+only Gaussian C/N nullspace coefficients change from std=1 to std=d^-1/2;
+U/V/E/F/Z, domains, raw RNG samples, cutoff, h/lambda/master seed stay unchanged.
+There is no free scale parameter, search or FFN-neuron scaling. Since CF=EN=0,
+PQ cancellation remains; Gram PSD ordering implies nonincreasing spectral norms,
+not a G2 error bound or guaranteed condition-ratio improvement. d=1 may produce
+identical matrix bytes but still has distinct algorithm/Secret identities.
+The changed sampling distribution does not claim unchanged paper privacy metrics.
+
+The fixed d576/h32/lambda0.3 trial reduced the P/Q spectral product from about
+761.97 to 2.73482, with PQ max about7.1e-15. It still failed the necessary
+native-F32 first-block gate on prompt2: FFN=1.1917904516e-5 and
+block=1.3106583758e-5. Other two prompts passing locally and improved key norms
+are not Phase3B acceptance. Formal full-model G2/G3/G4 were not run; no second
+scale/seed/dtype strategy was tried, and native runtime remains unchanged.
 
 With PyTorch row-vector weights: embedding uses EP; head/q/k/v/gate/up use
 WQ^T; o/down use P^TW. Norm weights remain logical `[d]`. A tied missing head

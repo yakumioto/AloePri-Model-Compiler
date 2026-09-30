@@ -14,6 +14,8 @@ from token_permutation_demo import load_json, load_local_llama_config
 
 METHOD = {"id": "aloepri-keymat", "version": "0.1"}
 ALGORITHM = "algorithm1-v1"
+BALANCED_ALGORITHM = "algorithm1-balanced-null-v2"
+SUPPORTED_ALGORITHMS = {ALGORITHM, BALANCED_ALGORITHM}
 RNG = "chacha20-rand0.9-normal0.5-v1"
 TOLERANCE = 1e-5
 
@@ -88,7 +90,8 @@ def load_keymat(secret_path):
     secret = load_json(secret_path)
     expected_fields = {"version", "method", "secret_id", "source_fingerprint", "hidden_size", "expansion_size", "lambda_bits", "algorithm", "rng", "master_seed", "nullspace_cutoff", "material_format", "material_file", "p_digest", "q_digest"}
     require(set(secret) == expected_fields, "unknown or missing Secret fields")
-    require(secret["version"] == 1 and secret["method"] == METHOD and secret["algorithm"] == ALGORITHM and secret["rng"] == RNG, "unsupported Secret version")
+    algorithm = secret["algorithm"]
+    require(secret["version"] == 1 and secret["method"] == METHOD and algorithm in SUPPORTED_ALGORITHMS and secret["rng"] == RNG, "unsupported Secret version")
     d, h = secret["hidden_size"], secret["expansion_size"]
     require(type(d) is int and type(h) is int and d > 0 and h > 0 and h % 2 == 0, "invalid KeyMat dimensions")
     big_d = d + 2 * h
@@ -101,7 +104,7 @@ def load_keymat(secret_path):
         check_hex(secret[name])
     commitment = blake3.blake3(b"aloepri-keymat-secret-v1")
     commitment.update(struct.pack("<I", 1))
-    for value in [METHOD["id"], METHOD["version"], secret["source_fingerprint"], ALGORITHM, RNG, secret["master_seed"], secret["material_format"], secret["material_file"], secret["p_digest"], secret["q_digest"]]:
+    for value in [METHOD["id"], METHOD["version"], secret["source_fingerprint"], algorithm, RNG, secret["master_seed"], secret["material_format"], secret["material_file"], secret["p_digest"], secret["q_digest"]]:
         encoded = value.encode("utf-8")
         commitment.update(struct.pack("<I", len(encoded)))
         commitment.update(encoded)
@@ -121,7 +124,7 @@ def load_keymat(secret_path):
     require(torch.isfinite(error).all().item() and error.max().item() <= TOLERANCE, "G1 KeyMat identity failed")
     ps, qs = torch.linalg.svdvals(p), torch.linalg.svdvals(q)
     diagnostics = {"max_abs_pq_error": error.max().item(), "mean_abs_pq_error": error.mean().item(), "finite_p": True, "finite_q": True, "p_frobenius_norm": p.norm().item(), "q_frobenius_norm": q.norm().item(), "p_spectral_norm": ps.max().item(), "q_spectral_norm": qs.max().item(), "p_condition_estimate": (ps.max() / ps.min()).item()}
-    binding = {"secret_id": secret["secret_id"], "source_fingerprint": secret["source_fingerprint"], "hidden_size": d, "expansion_size": h, "physical_hidden_size": big_d, "lambda_bits": bits, "algorithm": ALGORITHM, "rng": RNG}
+    binding = {"secret_id": secret["secret_id"], "source_fingerprint": secret["source_fingerprint"], "hidden_size": d, "expansion_size": h, "physical_hidden_size": big_d, "lambda_bits": bits, "algorithm": algorithm, "rng": RNG}
     return binding, p, q, diagnostics
 
 

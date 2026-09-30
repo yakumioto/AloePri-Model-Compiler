@@ -166,6 +166,12 @@ def main():
     report["source_fingerprint"] = manifest["source_fingerprint"]
     report["secret_id"] = manifest["secret_id"]
     report["physical_dimensions"] = manifest["runtime_contract"]["physical_dimensions"]
+    report["construction_profile"] = binding["algorithm"]
+    report["execution_profile"] = "f32-state-native-linear-v1"
+    report["plan_hash"] = manifest["plan_hash"]
+    report["layout_hash"] = manifest["layout_hash"]
+    from keymat_numerical_diagnostics import provenance
+    report["provenance"] = provenance()
     args.report.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     print(json.dumps({gate: report[gate]["status"] for gate in ["G1", "G2", "G3", "G4"]}))
     raise SystemExit(0 if all(report[gate]["status"] == "pass" for gate in ["G1", "G2", "G3", "G4"]) else 1)

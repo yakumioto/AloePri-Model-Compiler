@@ -55,7 +55,8 @@ fn transform(args: args::TransformArgs) -> Result<()> {
     if method != MethodContract::aloepri_keymat()
         && (args.expansion_size.is_some()
             || args.keymat_lambda.is_some()
-            || args.keymat_fixture_seed.is_some())
+            || args.keymat_fixture_seed.is_some()
+            || args.keymat_algorithm.is_some())
     {
         return Err(anyhow!("KeyMat parameters require --method aloepri-keymat"));
     }
@@ -194,10 +195,27 @@ fn transform_keymat(args: args::TransformArgs) -> Result<()> {
         let (secret, keys) = KeyMatSecretV1::read(secret_path, args.memory_limit)?;
         (secret, keys, None)
     } else {
-        let (secret, keys, condition) =
-            KeyMatSecretV1::generate(source, d, h, lambda, fixture_seed)?;
+        let (secret, keys, condition) = KeyMatSecretV1::generate_with_algorithm(
+            source,
+            d,
+            h,
+            lambda,
+            fixture_seed,
+            args.keymat_algorithm
+                .as_deref()
+                .unwrap_or(aloepri_core::keymat::KEYMAT_ALGORITHM),
+        )?;
         (secret, keys, Some(condition))
     };
+    if args
+        .keymat_algorithm
+        .as_deref()
+        .is_some_and(|algorithm| algorithm != secret.algorithm)
+    {
+        return Err(anyhow!(
+            "KeyMat algorithm flag does not match the existing Secret"
+        ));
+    }
     let binding = secret.binding()?;
     if binding.source_fingerprint != source
         || binding.hidden_size != d
@@ -236,7 +254,7 @@ fn transform_keymat(args: args::TransformArgs) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"keymat":diagnostics,"b_condition_estimate":b_condition,"memory_estimate":plan.memory_estimate,"generation_peak_bytes":peak,"transform":report})
+            &serde_json::json!({"algorithm":secret.algorithm,"keymat":diagnostics,"b_condition_estimate":b_condition,"memory_estimate":plan.memory_estimate,"generation_peak_bytes":peak,"transform":report})
         )?
     );
     Ok(())

@@ -94,3 +94,16 @@ roles. Manifest/checkpoint/shards contain no P/Q, private seed, material path or
 key tensor. Parameter/PQ identity changes affect secret_id and plan hash; resume
 also binds source, method, runtime and layout. Old v3 canonical fields/hashes
 and resume behavior remain unchanged.
+
+Algorithm identity is exact: `algorithm1-v1` retains unit-standard-deviation
+C/N coefficients; `algorithm1-balanced-null-v2` uses d^-1/2 for those coefficients
+only, with the same raw RNG substreams and bases. Existing JSON fields and binary
+format/schema are unchanged. Commitment and binding use the **actual** allowed
+algorithm string in both Rust and Python; changing only that string while keeping
+old digests/commitment is invalid. Never reinterpret or overwrite old material.
+
+Fresh CLI calls still default to v1; v2 requires explicit `--keymat-algorithm`.
+Resume without the flag uses its stored Secret's algorithm, while an explicit
+mismatch is rejected before staging/lock/writer. Interrupted and published
+v1↔v2 resumes are refused even when output layout hashes are equal: Secret/PQ/
+algorithm and plan identities, not layout inequality, distinguish the artifacts.

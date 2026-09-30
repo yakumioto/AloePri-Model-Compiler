@@ -144,6 +144,180 @@ fn cli_roundtrip_materializes_head_and_preserves_logical_config() {
 }
 
 #[test]
+fn explicit_algorithms_preserve_default_and_resume_the_actual_secret() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("source");
+    source(&input, true, false, "F32");
+    let mut manifests = Vec::new();
+    for (index, algorithm) in ["algorithm1-v1", "algorithm1-balanced-null-v2"]
+        .iter()
+        .enumerate()
+    {
+        let private = dir.path().join(format!("private-{index}"));
+        fs::create_dir(&private).unwrap();
+        let secret = private.join("secret.json");
+        let output = dir.path().join(format!("output-{index}"));
+        let flags = if index == 0 {
+            vec![]
+        } else {
+            vec!["--keymat-algorithm", *algorithm]
+        };
+        let result = cli(&input, &output, &secret, &flags);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let (loaded, _) = KeyMatSecretV1::read(&secret, u64::MAX).unwrap();
+        assert_eq!(loaded.algorithm, *algorithm);
+        let before = snapshot(dir.path());
+        let wrong = if index == 0 {
+            "algorithm1-balanced-null-v2"
+        } else {
+            "algorithm1-v1"
+        };
+        let mismatch = cli(
+            &input,
+            &output,
+            &secret,
+            &["--resume", "--keymat-algorithm", wrong],
+        );
+        assert!(!mismatch.status.success());
+        assert!(String::from_utf8_lossy(&mismatch.stderr).contains("algorithm flag"));
+        assert_eq!(before, snapshot(dir.path()));
+        let resumed = cli(&input, &output, &secret, &["--resume"]);
+        assert!(
+            resumed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        manifests.push(
+            serde_json::from_slice::<Value>(&fs::read(output.join("aloepri.json")).unwrap())
+                .unwrap(),
+        );
+    }
+    assert_eq!(manifests[0]["layout_hash"], manifests[1]["layout_hash"]);
+    assert_ne!(manifests[0]["secret_id"], manifests[1]["secret_id"]);
+    assert_ne!(manifests[0]["plan_hash"], manifests[1]["plan_hash"]);
+    for (method, algorithm) in [
+        ("identity", "algorithm1-v1"),
+        ("aloepri-keymat", "algorithm1-v3"),
+    ] {
+        let rejected = Command::new(env!("CARGO_BIN_EXE_aloepri"))
+            .args([
+                "transform",
+                input.to_str().unwrap(),
+                "--output",
+                dir.path().join("rejected").to_str().unwrap(),
+                "--method",
+                method,
+                "--keymat-algorithm",
+                algorithm,
+            ])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(!dir.path().join("rejected").exists());
+    }
+}
+
+#[test]
+fn algorithm_cross_resume_is_rejected_before_staging_or_lock_changes() {
+    use aloepri_core::keymat::{KEYMAT_ALGORITHM, KEYMAT_BALANCED_ALGORITHM};
+    for (original_algorithm, other_algorithm) in [
+        (KEYMAT_ALGORITHM, KEYMAT_BALANCED_ALGORITHM),
+        (KEYMAT_BALANCED_ALGORITHM, KEYMAT_ALGORITHM),
+    ] {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("source");
+        let output = dir.path().join("output");
+        source(&input, true, false, "F32");
+        let fingerprint = HfArtifact::open(&input).unwrap().fingerprint().unwrap();
+        let seed = *blake3::hash(&42_u64.to_le_bytes()).as_bytes();
+        let (secret, keys, _) = KeyMatSecretV1::generate_with_algorithm(
+            fingerprint,
+            4,
+            2,
+            0.3,
+            Some(seed),
+            original_algorithm,
+        )
+        .unwrap();
+        let (other, other_keys, _) = KeyMatSecretV1::generate_with_algorithm(
+            fingerprint,
+            4,
+            2,
+            0.3,
+            Some(seed),
+            other_algorithm,
+        )
+        .unwrap();
+        for (name, bundle, material) in
+            [("original", &secret, &keys), ("other", &other, &other_keys)]
+        {
+            let parent = dir.path().join(name);
+            fs::create_dir(&parent).unwrap();
+            bundle
+                .write_new(&parent.join("secret.json"), material)
+                .unwrap();
+        }
+        let original_path = dir.path().join("original/secret.json");
+        let other_path = dir.path().join("other/secret.json");
+        let keys = Arc::new(keys);
+        let config = TransformConfig {
+            method: MethodContract::aloepri_keymat(),
+            keymat_binding: Some(secret.binding().unwrap()),
+            max_shard_size: ByteLength(256),
+            ..TransformConfig::default()
+        };
+        let request = TransformRequest {
+            input: input.clone(),
+            output: output.clone(),
+            config,
+            resume: false,
+        };
+        assert!(
+            Compiler::new(
+                HfBackend,
+                Registry::new(),
+                Fault(KeyMatExecutor::new(&secret, keys).unwrap())
+            )
+            .transform(&request)
+            .is_err()
+        );
+        let interrupted = snapshot(dir.path());
+        let wrong_flag = cli(
+            &input,
+            &output,
+            &original_path,
+            &["--resume", "--keymat-algorithm", other_algorithm],
+        );
+        assert!(!wrong_flag.status.success());
+        assert_eq!(interrupted, snapshot(dir.path()));
+        let wrong_secret = cli(&input, &output, &other_path, &["--resume"]);
+        assert!(!wrong_secret.status.success());
+        assert_eq!(interrupted, snapshot(dir.path()));
+        let success = cli(&input, &output, &original_path, &["--resume"]);
+        assert!(
+            success.status.success(),
+            "{}",
+            String::from_utf8_lossy(&success.stderr)
+        );
+        let published = snapshot(dir.path());
+        let mismatch = cli(&input, &output, &other_path, &["--resume"]);
+        assert!(!mismatch.status.success());
+        assert_eq!(published, snapshot(dir.path()));
+        let original_success = cli(
+            &input,
+            &output,
+            &original_path,
+            &["--resume", "--keymat-algorithm", original_algorithm],
+        );
+        assert!(original_success.status.success());
+    }
+}
+
+#[test]
 fn bare_secret_filename_is_synced_before_publication() {
     let dir = tempdir().unwrap();
     let input = dir.path().join("source");

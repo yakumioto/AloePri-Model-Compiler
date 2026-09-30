@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 
 pub const KEYMAT_SCHEMA_VERSION: u32 = 4;
 pub const KEYMAT_ALGORITHM: &str = "algorithm1-v1";
+pub const KEYMAT_BALANCED_ALGORITHM: &str = "algorithm1-balanced-null-v2";
+
+pub fn validate_algorithm(algorithm: &str) -> Result<()> {
+    match algorithm {
+        KEYMAT_ALGORITHM | KEYMAT_BALANCED_ALGORITHM => Ok(()),
+        _ => Err(CompilerError::Unsupported(format!(
+            "unsupported KeyMat algorithm {algorithm}"
+        ))),
+    }
+}
 pub const KEYMAT_RNG: &str = "chacha20-rand0.9-normal0.5-v1";
 pub const KEYMAT_TOLERANCE: f64 = 1e-5;
 
@@ -21,8 +31,8 @@ pub struct KeyMatBinding {
 
 impl KeyMatBinding {
     pub fn validate(&self) -> Result<()> {
+        validate_algorithm(&self.algorithm)?;
         if physical_hidden_size(self.hidden_size, self.expansion_size)? != self.physical_hidden_size
-            || self.algorithm != KEYMAT_ALGORITHM
             || self.rng != KEYMAT_RNG
             || self.secret_id.len() != 64
             || !self

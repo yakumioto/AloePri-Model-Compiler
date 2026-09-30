@@ -221,3 +221,47 @@ not installed across the model: its prerequisite local gate failed, so candidate
 full-model G2/G3/G4 are `not_run`. No source, Secret, artifact/schema, norm,
 fixture or tolerance was changed. These results neither prove all F32 strategies
 impossible nor authorize relaxing the gate; further changes require a new plan.
+
+### Versioned balanced-null construction — still blocked
+
+The single fixed `algorithm1-balanced-null-v2` trial changes only C/N nullspace
+coefficient std from1 to d^-1/2, retaining raw substreams/bases and the same
+source, h/lambda/master seed and input fixture. The original v1 defaults and
+failed artifacts are retained. New P/Q/Secret/plan/artifact identities are
+intentional; do not reuse or overwrite the old private directory or staging.
+Both versions use Secret schema1, KeyMat artifact schema4, method0.1 and native
+F32 runtime. This is a sampling-distribution engineering variant, not a claim
+of unchanged reference distribution or paper privacy guarantees.
+
+```bash
+mkdir PRIVATE_BALANCED_DIR
+aloepri transform SOURCE_F32 --output OUTPUT_BALANCED \
+  --method aloepri-keymat --keymat-algorithm algorithm1-balanced-null-v2 \
+  --expansion-size 32 --keymat-lambda 0.3 --keymat-fixture-seed 20260930 \
+  --secret-output PRIVATE_BALANCED_DIR/secret.json \
+  --memory-limit 256MiB --max-shard-size 32MiB
+aloepri verify OUTPUT_BALANCED
+HF_HUB_OFFLINE=1 python demo/keymat_numerical_diagnostics.py \
+  --source SOURCE_F32 --artifact OUTPUT_BALANCED \
+  --secret PRIVATE_BALANCED_DIR/secret.json \
+  --fixture demo/hidden_expansion_fixture.json --failure-report ORIGINAL_GATES_JSON \
+  --construction-trial --control-secret PRIVATE_DIR/keymat-secret.json \
+  --control-diagnostics numerical-diagnostics.json --report balanced-first-block.json \
+  --private-error-vectors PRIVATE_BALANCED_DIR/diagnostic-errors.pt
+```
+
+The trial has a separate strict identity check; it is not the v1 same-Secret
+replay and does not weaken its validation. Only after all original first-block
+nodes pass for all three fixed sequences may the formal full-model harness run.
+Fresh omitted algorithm still means v1; omitted resume algorithm means the
+stored Secret's actual version. Explicit mismatch and v1↔v2 interrupted/published
+resume fail before touching staging/locks, including equal-layout cases.
+
+Actual v2 P/Q spectral norms were about1.61916/1.68904 (product2.73482),
+PQ max about7.1e-15, and complete first-FFN F32 encoding oracle error0/ULP0.
+The first two sequences passed locally, but prompt2 still failed
+`layer.0.ffn_output` at1.1917904516e-5 and block output at1.3106583758e-5.
+The once-only trial stopped: full-model v2 G2/G3/G4 are not_run. No scale/seed
+search, F64 model/state/residual or failed accumulation candidate was installed.
+Phase3B remains incomplete; lower key norms and structure/unit passes do not
+replace the unchanged absolute1e-5 acceptance gate.

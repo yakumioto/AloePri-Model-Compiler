@@ -5,8 +5,8 @@ use aloepri_core::{
     CompilerError, MethodContract, ModelFingerprint, Result,
     error::{io_error, json_error},
     keymat::{
-        KEYMAT_ALGORITHM, KEYMAT_RNG, KEYMAT_TOLERANCE, KeyMatBinding, lambda_bits,
-        physical_hidden_size,
+        KEYMAT_ALGORITHM, KEYMAT_BALANCED_ALGORITHM, KEYMAT_RNG, KEYMAT_TOLERANCE, KeyMatBinding,
+        lambda_bits, physical_hidden_size, validate_algorithm,
     },
 };
 use nalgebra::{DMatrix, linalg::SVD};
@@ -144,6 +144,18 @@ impl KeyMatSecretV1 {
         lambda: f64,
         seed: Option<[u8; 32]>,
     ) -> Result<(Self, KeyMaterial, f64)> {
+        Self::generate_with_algorithm(source, d, h, lambda, seed, KEYMAT_ALGORITHM)
+    }
+
+    pub fn generate_with_algorithm(
+        source: ModelFingerprint,
+        d: u64,
+        h: u64,
+        lambda: f64,
+        seed: Option<[u8; 32]>,
+        algorithm: &str,
+    ) -> Result<(Self, KeyMaterial, f64)> {
+        validate_algorithm(algorithm)?;
         let big_d = physical_hidden_size(d, h)?;
         aloepri_core::keymat::generation_peak_bytes(d, h)?;
         let lambda_bits = lambda_bits(lambda)?;
@@ -156,8 +168,13 @@ impl KeyMatSecretV1 {
                 seed
             }
         };
-        let (material, b_condition) =
-            generate(d as usize, h as usize, f64::from_bits(lambda_bits), &seed)?;
+        let (material, b_condition) = generate(
+            d as usize,
+            h as usize,
+            f64::from_bits(lambda_bits),
+            &seed,
+            algorithm,
+        )?;
         let mut secret = Self {
             version: 1,
             method: MethodContract::aloepri_keymat(),
@@ -166,7 +183,7 @@ impl KeyMatSecretV1 {
             hidden_size: d,
             expansion_size: h,
             lambda_bits,
-            algorithm: KEYMAT_ALGORITHM.into(),
+            algorithm: algorithm.into(),
             rng: KEYMAT_RNG.into(),
             master_seed: hex_encode(&seed),
             nullspace_cutoff: 1e-10,
@@ -196,6 +213,7 @@ impl KeyMatSecretV1 {
     }
 
     pub fn validate(&self) -> Result<()> {
+        validate_algorithm(&self.algorithm)?;
         physical_hidden_size(self.hidden_size, self.expansion_size)?;
         let source = ModelFingerprint::from_hex(&self.source_fingerprint)?;
         decode_hex_32(&self.master_seed, "KeyMat seed")?;
@@ -204,7 +222,6 @@ impl KeyMatSecretV1 {
         if self.version != 1
             || self.method != MethodContract::aloepri_keymat()
             || source.to_string() != self.source_fingerprint
-            || self.algorithm != KEYMAT_ALGORITHM
             || self.rng != KEYMAT_RNG
             || lambda_bits(f64::from_bits(self.lambda_bits))? != self.lambda_bits
             || self.nullspace_cutoff != 1e-10
@@ -450,8 +467,19 @@ fn nullspace(matrix: &DMatrix<f64>) -> Result<DMatrix<f64>> {
     }))
 }
 
-fn generate(d: usize, h: usize, lambda: f64, seed: &[u8; 32]) -> Result<(KeyMaterial, f64)> {
+fn generate(
+    d: usize,
+    h: usize,
+    lambda: f64,
+    seed: &[u8; 32],
+    algorithm: &str,
+) -> Result<(KeyMaterial, f64)> {
     let scale = 1.0 / (d as f64).sqrt();
+    let null_scale = match algorithm {
+        KEYMAT_ALGORITHM => 1.0,
+        KEYMAT_BALANCED_ALGORITHM => scale,
+        _ => return Err(invalid("unsupported KeyMat generation algorithm")),
+    };
     let b = orthogonal(d, seed, "U") + gaussian(d, d, seed, "V", scale) * lambda;
     let singular = singular_values(b.clone())?;
     let b_condition = singular.iter().copied().fold(0.0, f64::max)
@@ -466,9 +494,9 @@ fn generate(d: usize, h: usize, lambda: f64, seed: &[u8; 32]) -> Result<(KeyMate
     let e = gaussian(d, h / 2, seed, "E1", scale) * gaussian(h / 2, h, seed, "E2", scale);
     let f = gaussian(h, h / 2, seed, "F1", scale) * gaussian(h / 2, d, seed, "F2", scale);
     let fb = nullspace(&f.transpose())?;
-    let c = gaussian(d, fb.ncols(), seed, "C", 1.0) * fb.transpose();
+    let c = gaussian(d, fb.ncols(), seed, "C", null_scale) * fb.transpose();
     let eb = nullspace(&e)?;
-    let n = &eb * gaussian(eb.ncols(), d, seed, "N", 1.0);
+    let n = &eb * gaussian(eb.ncols(), d, seed, "N", null_scale);
     let big_d = d + 2 * h;
     let z = orthogonal(big_d, seed, "Z");
     let mut left = DMatrix::zeros(d, big_d);
@@ -526,6 +554,164 @@ mod tests {
             assert!(pq.p.iter().any(|v| v.abs() > 0.1));
         }
     }
+    #[test]
+    fn v1_golden_and_versioned_identity_remain_stable() {
+        let source = ModelFingerprint::from_hex(
+            "5a22a0ce4810146973bf43b941a7a530fab6147abd4354c6d0ab0cf5666af431",
+        )
+        .unwrap();
+        let (v1, original, _) =
+            KeyMatSecretV1::generate(source, 8, 2, 0.3, Some([42; 32])).unwrap();
+        assert_eq!(
+            v1.p_digest,
+            "0cd0e4344a8f2ff6cf28c040df4e1e2fa069a49941c698073686153cd9120c40"
+        );
+        assert_eq!(
+            v1.q_digest,
+            "725f87f6a1355241e593901b0e8fba75f1094ce27e73a167fc641964a666fe2e"
+        );
+        assert_eq!(
+            v1.secret_id,
+            "bb09de48c02e788add2b65c992c2117ea778534602572dc92a6c345345fd6b83"
+        );
+        let (explicit, same, _) = KeyMatSecretV1::generate_with_algorithm(
+            source,
+            8,
+            2,
+            0.3,
+            Some([42; 32]),
+            KEYMAT_ALGORITHM,
+        )
+        .unwrap();
+        assert_eq!(explicit.secret_id, v1.secret_id);
+        assert_eq!(same.p, original.p);
+        assert_eq!(same.q, original.q);
+        let (v2, balanced, _) = KeyMatSecretV1::generate_with_algorithm(
+            source,
+            8,
+            2,
+            0.3,
+            Some([42; 32]),
+            KEYMAT_BALANCED_ALGORITHM,
+        )
+        .unwrap();
+        let (again, repeated, _) = KeyMatSecretV1::generate_with_algorithm(
+            source,
+            8,
+            2,
+            0.3,
+            Some([42; 32]),
+            KEYMAT_BALANCED_ALGORITHM,
+        )
+        .unwrap();
+        assert_eq!(v2.secret_id, again.secret_id);
+        assert_eq!(balanced.p, repeated.p);
+        assert_eq!(balanced.q, repeated.q);
+        assert_ne!(v1.secret_id, v2.secret_id);
+        assert_ne!(v1.p_digest, v2.p_digest);
+        assert_ne!(v1.q_digest, v2.q_digest);
+        let mut tampered = v1.clone();
+        tampered.algorithm = KEYMAT_BALANCED_ALGORITHM.into();
+        assert!(tampered.validate().is_err());
+        for algorithm in ["", "algorithm1-v1-extra", "algorithm1-balanced-null-v3"] {
+            assert!(
+                KeyMatSecretV1::generate_with_algorithm(
+                    source,
+                    8,
+                    2,
+                    0.3,
+                    Some([42; 32]),
+                    algorithm
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn balanced_nullspace_preserves_bases_cross_terms_and_gram_relations() {
+        let seed = [7; 32];
+        for (d, h) in [(8, 2), (4, 8), (1, 2)] {
+            let (v1, original, _) =
+                KeyMatSecretV1::generate(source(), d, h, 0.3, Some(seed)).unwrap();
+            let (v2, balanced, _) = KeyMatSecretV1::generate_with_algorithm(
+                source(),
+                d,
+                h,
+                0.3,
+                Some(seed),
+                KEYMAT_BALANCED_ALGORITHM,
+            )
+            .unwrap();
+            let d = d as usize;
+            let h = h as usize;
+            let big_d = d + 2 * h;
+            let scale = 1.0 / (d as f64).sqrt();
+            let z = orthogonal(big_d, &seed, "Z");
+            let p1 = DMatrix::from_row_slice(d, big_d, &original.p);
+            let q1 = DMatrix::from_row_slice(big_d, d, &original.q);
+            let p2 = DMatrix::from_row_slice(d, big_d, &balanced.p);
+            let q2 = DMatrix::from_row_slice(big_d, d, &balanced.q);
+            let left1 = &p1 * z.transpose();
+            let left2 = &p2 * z.transpose();
+            let right1 = &z * &q1;
+            let right2 = &z * &q2;
+            let b = left1.columns(0, d).into_owned();
+            let c = left1.columns(d, h).into_owned();
+            let e = left1.columns(d + h, h).into_owned();
+            let inverse = right1.rows(0, d).into_owned();
+            let f = right1.rows(d, h).into_owned();
+            let n = right1.rows(d + h, h).into_owned();
+            assert!((left2.columns(0, d) - &b).amax() < 1e-11);
+            assert!((left2.columns(d, h) - &c * scale).amax() < 1e-11);
+            assert!((left2.columns(d + h, h) - &e).amax() < 1e-11);
+            assert!((right2.rows(0, d) - &inverse).amax() < 1e-11);
+            assert!((right2.rows(d, h) - &f).amax() < 1e-11);
+            assert!((right2.rows(d + h, h) - &n * scale).amax() < 1e-11);
+            assert!((&c * &f).amax() < 1e-10);
+            assert!((&e * &n).amax() < 1e-10);
+            let p_expected =
+                &b * b.transpose() + (&c * c.transpose()) * (scale * scale) + &e * e.transpose();
+            let q_expected = inverse.transpose() * &inverse
+                + f.transpose() * &f
+                + (n.transpose() * &n) * (scale * scale);
+            assert!((&p2 * p2.transpose() - p_expected).amax() < 1e-10);
+            assert!((q2.transpose() * &q2 - q_expected).amax() < 1e-10);
+            assert!((&p2 * &q2 - DMatrix::identity(d, d)).amax() < 1e-10);
+            let p1s = singular_values(p1).unwrap();
+            let q1s = singular_values(q1).unwrap();
+            let p2s = singular_values(p2).unwrap();
+            let q2s = singular_values(q2).unwrap();
+            let bs = singular_values(b).unwrap();
+            let inverse_s = singular_values(inverse).unwrap();
+            assert!(
+                p2s.iter().copied().fold(0.0, f64::max)
+                    <= p1s.iter().copied().fold(0.0, f64::max) + 1e-10
+            );
+            assert!(
+                q2s.iter().copied().fold(0.0, f64::max)
+                    <= q1s.iter().copied().fold(0.0, f64::max) + 1e-10
+            );
+            assert!(
+                p2s.iter().copied().fold(f64::INFINITY, f64::min)
+                    >= bs.iter().copied().fold(f64::INFINITY, f64::min) - 1e-10
+            );
+            assert!(
+                q2s.iter().copied().fold(f64::INFINITY, f64::min)
+                    >= inverse_s.iter().copied().fold(f64::INFINITY, f64::min) - 1e-10
+            );
+            assert_ne!(v1.secret_id, v2.secret_id);
+            if d == 1 {
+                assert_eq!(original.p, balanced.p);
+                assert_eq!(original.q, balanced.q);
+            } else {
+                assert_ne!(original.p, balanced.p);
+                assert_ne!(original.q, balanced.q);
+            }
+            assert!(balanced.p.iter().any(|v| v.abs() > 0.1));
+        }
+    }
+
     #[test]
     fn independent_nullspace_and_qr_checks() {
         let seed = [7; 32];

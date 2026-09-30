@@ -40,11 +40,82 @@ class RuntimeTests(unittest.TestCase):
         if result.returncode:
             raise AssertionError(result.stderr)
         cls.model, cls.q, cls.diagnostics = runtime.load_runtime(cls.artifact, cls.secret)
+        balanced_private = cls.root / "balanced-private"
+        balanced_private.mkdir()
+        cls.balanced_secret = balanced_private / "secret.json"
+        cls.balanced_artifact = cls.root / "balanced-artifact"
+        result = subprocess.run([str(binary), "transform", str(cls.source), "--output", str(cls.balanced_artifact), "--method", "aloepri-keymat", "--keymat-algorithm", runtime.BALANCED_ALGORITHM, "--expansion-size", "2", "--keymat-lambda", "0.3", "--keymat-fixture-seed", "42", "--secret-output", str(cls.balanced_secret), "--max-shard-size", "1KiB"], capture_output=True, text=True)
+        if result.returncode:
+            raise AssertionError(result.stderr)
         cls.fixture = {"prompts": [[1, 4], [3, 7, 9]], "continuation_ids": [5, 8], "max_new_tokens": 3}
 
     @classmethod
     def tearDownClass(cls):
         cls.directory.cleanup()
+
+    def test_actual_algorithm_commitment_and_cross_version_binding(self):
+        v1, p1, q1, _ = runtime.load_keymat(self.secret)
+        v2, p2, q2, _ = runtime.load_keymat(self.balanced_secret)
+        self.assertEqual(v1["algorithm"], runtime.ALGORITHM)
+        self.assertEqual(v2["algorithm"], runtime.BALANCED_ALGORITHM)
+        self.assertNotEqual(v1["secret_id"], v2["secret_id"])
+        self.assertFalse(torch.equal(p1, p2))
+        self.assertFalse(torch.equal(q1, q2))
+        for artifact, secret in [(self.artifact, self.balanced_secret), (self.balanced_artifact, self.secret)]:
+            with self.assertRaises(ValueError):
+                runtime.load_runtime(artifact, secret)
+        model, q, diagnostics = runtime.load_runtime(self.balanced_artifact, self.balanced_secret)
+        report = demo.run_gates(self.baseline, model, q, diagnostics, self.fixture)
+        self.assertEqual([report[g]["status"] for g in ["G1", "G2", "G3", "G4"]], ["pass"] * 4, report)
+        self.assertTrue(diagnostic.state_summary(model, 12)["state_dict_f32"])
+        original = self.secret.read_bytes()
+        try:
+            for algorithm in [runtime.BALANCED_ALGORITHM, "algorithm1-v1-extra", "algorithm1-balanced-null-v3"]:
+                value = json.loads(original)
+                value["algorithm"] = algorithm
+                self.secret.write_text(json.dumps(value))
+                with self.assertRaises(ValueError):
+                    runtime.load_keymat(self.secret)
+        finally:
+            self.secret.write_bytes(original)
+
+    def test_new_construction_identity_never_weakens_legacy_replay(self):
+        manifest = json.loads((self.artifact / "aloepri.json").read_text())
+        fixture = dict(self.fixture, h=2, **{"lambda": 0.3, "fixture_seed": 42})
+        fixture_path = self.root / "trial-fixture.json"
+        failure_path = self.root / "trial-historical-failure.json"
+        control_path = self.root / "trial-control.json"
+        fixture_path.write_text(json.dumps(fixture))
+        historical_nodes = []
+        for prompt in fixture["prompts"]:
+            base, _ = diagnostic.trace_first_block(self.baseline, prompt + fixture["continuation_ids"])
+            native, _ = diagnostic.trace_first_block(self.model, prompt + fixture["continuation_ids"])
+            historical_nodes.append(demo.compare_nodes(base, native, self.q))
+        failure = {"fixture": fixture, "source_fingerprint": manifest["source_fingerprint"], "secret_id": manifest["secret_id"],
+                   "G1": {"status": "pass"}, "G2": {"status": "fail", "prompts": historical_nodes}}
+        failure_path.write_text(json.dumps(failure))
+        control = {"identity": {"source_fingerprint": manifest["source_fingerprint"], "secret_id": manifest["secret_id"],
+            "plan_hash": manifest["plan_hash"], "fixture_blake3": runtime.blake3.blake3(fixture_path.read_bytes()).hexdigest()}}
+        control_path.write_text(json.dumps(control))
+        args = (self.source, self.balanced_artifact, self.balanced_secret, fixture_path, failure_path)
+        with self.assertRaises(ValueError):
+            diagnostic.check_replay_identity(*args)
+        _, _, snapshot = diagnostic.check_construction_trial_identity(*args, self.secret, control_path)
+        self.assertEqual(snapshot["algorithm"], runtime.BALANCED_ALGORITHM)
+        self.assertNotEqual(snapshot["secret_id"], snapshot["historical_secret_id"])
+        model, q, keymat = runtime.load_runtime(self.balanced_artifact, self.balanced_secret)
+        report = diagnostic.diagnose(self.baseline, model, q, fixture, failure, {}, construction_trial=True)
+        self.assertTrue(report["first_block_trial_pass"])
+        self.assertTrue(all("native_failure_replay_delta" not in item for item in report["prompts"]))
+        comparison = diagnostic.construction_norm_comparison(model, keymat, self.secret)
+        self.assertLessEqual(comparison["trial_norm_product"], comparison["control_norm_product"])
+        before = fixture_path.read_bytes()
+        try:
+            fixture_path.write_bytes(before + b"\n")
+            with self.assertRaises(ValueError):
+                diagnostic.check_construction_trial_identity(*args, self.secret, control_path)
+        finally:
+            fixture_path.write_bytes(before)
 
     def test_tiny_gqa_layerwise_cache_logits_and_generation(self):
         report = demo.run_gates(self.baseline, self.model, self.q, self.diagnostics, self.fixture)
