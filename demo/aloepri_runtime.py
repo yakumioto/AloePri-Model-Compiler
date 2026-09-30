@@ -144,6 +144,9 @@ def tensor_specs(config, big_d):
 
 
 F64_LINEAR_ROW_CHUNK = 1024
+NATIVE_LINEAR_PROFILE = "f32-state-native-linear-v1"
+ALL_BOUNDARY_LINEAR_PROFILE = "balanced-v2-all-boundary-f64-acc-v1"
+SUPPORTED_LINEAR_PROFILES = {NATIVE_LINEAR_PROFILE, ALL_BOUNDARY_LINEAR_PROFILE}
 
 
 class F64AccumLinear(torch.nn.Linear):
@@ -193,6 +196,101 @@ class F64AccumLinear(torch.nn.Linear):
         return output
 
 
+def _linear_targets(model, big_d):
+    config = model.config
+    require(len(model.model.layers) == config.num_hidden_layers, "profile layer count mismatch")
+    specs = tensor_specs(config, big_d)
+    targets = []
+    for index, layer in enumerate(model.model.layers):
+        for section, members in [("self_attn", ["q_proj", "k_proj", "v_proj", "o_proj"]),
+                                 ("mlp", ["gate_proj", "up_proj", "down_proj"])]:
+            parent = getattr(layer, section)
+            for member in members:
+                name = f"model.layers.{index}.{section}.{member}"
+                out_features, in_features = specs[name + ".weight"]
+                targets.append((name, parent, member, in_features, out_features))
+    targets.append(("lm_head", model, "lm_head", big_d, config.vocab_size))
+    require(len(targets) == 7 * config.num_hidden_layers + 1, "incomplete profile target inventory")
+    return targets
+
+
+def _validate_linear_targets(targets, implementation):
+    for name, parent, member, in_features, out_features in targets:
+        module = getattr(parent, member)
+        require(type(module) is implementation, f"mixed/partial Linear profile at {name}")
+        require(module.bias is None and module.weight.dtype == torch.float32 and module.weight.device.type == "cpu", f"profile requires CPU/F32/no-bias at {name}")
+        require(module.in_features == in_features and module.out_features == out_features and tuple(module.weight.shape) == (out_features, in_features), f"profile geometry mismatch at {name}")
+
+
+def linear_profile_summary(model):
+    require(hasattr(model, "_aloepri_linear_profile"), "runtime profile metadata is missing")
+    profile = model._aloepri_linear_profile
+    require(profile in SUPPORTED_LINEAR_PROFILES, "unknown installed Linear profile")
+    if profile == ALL_BOUNDARY_LINEAR_PROFILE:
+        require(model._aloepri_construction_algorithm == BALANCED_ALGORITHM, "all-boundary profile requires balanced-v2")
+    targets = _linear_targets(model, model._aloepri_physical_hidden_size)
+    implementation = F64AccumLinear if profile == ALL_BOUNDARY_LINEAR_PROFILE else torch.nn.Linear
+    _validate_linear_targets(targets, implementation)
+    require(all(getattr(parent, member).weight is original for (_, parent, member, _, _), original in zip(targets, model._aloepri_linear_parameters)), "profile changed Parameter objects")
+    require(len(model._aloepri_linear_parameters) == len(targets), "profile Parameter inventory mismatch")
+    require(all(value.dtype == torch.float32 and value.device.type == "cpu" for value in model.parameters()), "non-F32/CPU model parameters")
+    require(all(value.dtype == torch.float32 for value in model.state_dict().values()), "non-F32 persistent model state")
+    require(model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr(), "profile retied physical head")
+    roles = [{"name": name, "in_features": width, "out_features": height,
+              "implementation": type(getattr(parent, member)).__name__, "parameter_dtype": "torch.float32"}
+             for name, parent, member, width, height in targets]
+    return {"execution_profile": profile, "construction_profile": model._aloepri_construction_algorithm,
+            "installed_role_count": len(roles), "wrapped_role_count": len(roles) if implementation is F64AccumLinear else 0,
+            "parameter_objects_preserved": True, "parameters_and_state_f32": True, "physical_head_independent": True,
+            "physical_hidden_size": model._aloepri_physical_hidden_size, "roles": roles}
+
+
+def install_linear_profile(model, algorithm, big_d, *, linear_profile=NATIVE_LINEAR_PROFILE):
+    require(linear_profile in SUPPORTED_LINEAR_PROFILES, "unknown Linear execution profile")
+    require(algorithm in SUPPORTED_ALGORITHMS, "unknown profile construction algorithm")
+    if linear_profile == ALL_BOUNDARY_LINEAR_PROFILE:
+        require(algorithm == BALANCED_ALGORITHM, "all-boundary profile requires balanced-v2 artifact")
+    targets = _linear_targets(model, big_d)
+    if hasattr(model, "_aloepri_linear_profile"):
+        current = linear_profile_summary(model)
+        require(current["construction_profile"] == algorithm and current["physical_hidden_size"] == big_d, "profile identity metadata mismatch")
+        if current["execution_profile"] == linear_profile:
+            return current
+        require(current["execution_profile"] == NATIVE_LINEAR_PROFILE and linear_profile == ALL_BOUNDARY_LINEAR_PROFILE, "profile cannot silently switch/fallback")
+    _validate_linear_targets(targets, torch.nn.Linear)
+    originals = tuple(getattr(parent, member).weight for _, parent, member, _, _ in targets)
+    state_keys = tuple(model.state_dict())
+    replacements = [(parent, member, F64AccumLinear.from_linear(getattr(parent, member)))
+                    for _, parent, member, _, _ in targets] if linear_profile == ALL_BOUNDARY_LINEAR_PROFILE else []
+    for parent, member, replacement in replacements:
+        setattr(parent, member, replacement)
+    model._aloepri_linear_profile = linear_profile
+    model._aloepri_construction_algorithm = algorithm
+    model._aloepri_physical_hidden_size = big_d
+    model._aloepri_linear_parameters = originals
+    require(tuple(model.state_dict()) == state_keys, "profile changed state_dict keys")
+    return linear_profile_summary(model)
+
+
+def linear_profile_costs(model):
+    installed = linear_profile_summary(model)
+    costs = []
+    for name, parent, member, _, _ in _linear_targets(model, model._aloepri_physical_hidden_size):
+        module = getattr(parent, member)
+        if type(module) is F64AccumLinear:
+            costs.append({"name": name, "calls": module.calls, "elapsed_seconds": module.elapsed_seconds,
+                          "peak_f64_temporary_bytes": module.peak_f64_temporary_bytes,
+                          "peak_working_bytes": module.peak_working_bytes, "output_row_chunk": F64_LINEAR_ROW_CHUNK})
+    largest = max(costs, key=lambda row: row["peak_f64_temporary_bytes"], default=None)
+    return {"execution_profile": installed["execution_profile"], "installed_scope_count": installed["installed_role_count"],
+            "executed_scope_count": sum(row["calls"] > 0 for row in costs), "executed_roles": [row["name"] for row in costs if row["calls"]],
+            "max_temporary_module": largest["name"] if largest else None,
+            "peak_f64_temporary_bytes": largest["peak_f64_temporary_bytes"] if largest else 0,
+            "peak_working_bytes": max((row["peak_working_bytes"] for row in costs), default=0),
+            "total_linear_elapsed_seconds": sum(row["elapsed_seconds"] for row in costs), "roles": costs,
+            "memory_note": "maximum simultaneously live per-Linear tensors, not sum of independent peaks or process RSS"}
+
+
 class ExactCovariantNorm(LlamaRMSNorm):
     def __init__(self, d, eps, p, q):
         super().__init__(d, eps)
@@ -206,7 +304,8 @@ class ExactCovariantNorm(LlamaRMSNorm):
         return (normalized.double() @ self._p).float()
 
 
-def load_runtime(artifact_root, secret_path):
+def load_runtime(artifact_root, secret_path, *, linear_profile=NATIVE_LINEAR_PROFILE):
+    require(linear_profile in SUPPORTED_LINEAR_PROFILES, "unknown Linear execution profile")
     require(transformers.__version__ == "5.5.0" and torch.__version__.split("+")[0] == "2.9.1", "runtime requires the pinned demo dependencies")
     root, secret_path = Path(artifact_root).resolve(), Path(secret_path)
     require(not secret_path.resolve().is_relative_to(root), "Secret must be outside the artifact")
@@ -309,6 +408,7 @@ def load_runtime(artifact_root, secret_path):
     model.load_state_dict(states, strict=True, assign=True)
     require(model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr(), "physical embedding/head must not be retied")
     model.eval()
+    install_linear_profile(model, binding["algorithm"], big_d, linear_profile=linear_profile)
     return model, q, diagnostics
 
 
@@ -337,9 +437,10 @@ def main():
     parser.add_argument("--prompt", default="Once upon a time")
     parser.add_argument("--token-ids", type=int, nargs="+")
     parser.add_argument("--max-new-tokens", type=int, default=0)
+    parser.add_argument("--linear-profile", choices=sorted(SUPPORTED_LINEAR_PROFILES), default=NATIVE_LINEAR_PROFILE)
     args = parser.parse_args()
     torch.set_num_threads(1)
-    model, _, diagnostics = load_runtime(args.artifact, args.secret)
+    model, _, diagnostics = load_runtime(args.artifact, args.secret, linear_profile=args.linear_profile)
     tokenizer = None
     if args.token_ids:
         ids = args.token_ids
@@ -350,7 +451,7 @@ def main():
     with torch.inference_mode():
         logits = model(input_ids=torch.tensor([ids]), use_cache=False).logits
     tokens = greedy(model, ids, args.max_new_tokens, model.config.eos_token_id) if args.max_new_tokens else ids
-    print(json.dumps({"mode": "exact_covariant", "keymat": diagnostics, "logits_shape": list(logits.shape), "finite_logits": torch.isfinite(logits).all().item(), "token_ids": tokens, "text": tokenizer.decode(tokens) if tokenizer else None}))
+    print(json.dumps({"mode": "exact_covariant", "keymat": diagnostics, "installed_linear_profile": linear_profile_summary(model), "linear_costs": linear_profile_costs(model), "logits_shape": list(logits.shape), "finite_logits": torch.isfinite(logits).all().item(), "token_ids": tokens, "text": tokenizer.decode(tokens) if tokenizer else None}))
 
 
 if __name__ == "__main__":

@@ -265,3 +265,51 @@ The once-only trial stopped: full-model v2 G2/G3/G4 are not_run. No scale/seed
 search, F64 model/state/residual or failed accumulation candidate was installed.
 Phase3B remains incomplete; lower key norms and structure/unit passes do not
 replace the unchanged absolute1e-5 acceptance gate.
+
+### Explicit same-v2 all-boundary profile — still blocked
+
+`load_runtime(artifact, secret, *, linear_profile=...)` defaults to
+`f32-state-native-linear-v1`. The only new opt-in is
+`balanced-v2-all-boundary-f64-acc-v1`, restricted to existing balanced-v2
+artifacts. It reuses temporary F64 Linear arithmetic with fixed1024 row chunks
+and F32 Parameter/state/input/output/residual; norm, Attention internals, RoPE,
+SwiGLU and cache remain unchanged. There is no artifact regeneration, new key
+family, persistent F64 shadow or silent fallback.
+
+The shared installer checks all `7*layers+1` roles, exact geometry, CPU/F32 and
+bias=None, preserving original Parameter objects/state keys/head independence.
+It prepares every replacement before mutation and rejects unknown/v1/mixed/
+partial/misreported profiles. A repeated same-profile install validates before
+returning. Reports derive profile from actual module inventory, not the flag.
+
+```bash
+HF_HUB_OFFLINE=1 python demo/keymat_numerical_diagnostics.py \
+  --execution-profile-trial --linear-profile balanced-v2-all-boundary-f64-acc-v1 \
+  --source SOURCE_F32 --artifact EXISTING_V2_ARTIFACT \
+  --secret EXISTING_V2_PRIVATE/secret.json --fixture demo/hidden_expansion_fixture.json \
+  --reference-trial balanced-first-block.json --report profile-first-block.json
+
+# Run only if the above necessary local gate passes for every sequence/node:
+HF_HUB_OFFLINE=1 python demo/hidden_expansion_demo.py \
+  --linear-profile balanced-v2-all-boundary-f64-acc-v1 \
+  --source SOURCE_F32 --artifact EXISTING_V2_ARTIFACT \
+  --secret EXISTING_V2_PRIVATE/secret.json --fixture demo/hidden_expansion_fixture.json \
+  --report profile-gates.json
+```
+
+The native control replayed every original v2 first-block node. All211 roles
+were installed in the candidate, but only layer0's seven roles executed; head
+and later-layer installation is not proof of numerical equivalence. Prompt0
+passed locally (max7.28893e-6), while prompt1/prompt2 failed FFN at
+1.0797817197e-5 / 1.3192825580e-5 and block output at
+1.0934948847e-5 / 1.4176833531e-5. The fixed profile stopped: full-model candidate
+G2/G3/G4 are not_run. No search or threshold/baseline change followed.
+
+Measured per-Linear peak temporary F64 tensors were8073216 bytes
+(8134656 including F32 output/scratch), largest at layer0 down. CPU/role calls
+and cumulative process RSS are separately reported; these are not Compiler
+memory-limit or independent summed peaks. The source-free subprocess validated
+all211 installed roles, F32/D640 first-block outputs and first-layer projection
+cache [1,3,4,64], without SOURCE or Llama.from_pretrained. It did not execute
+head/later layers or generation. This remains a diagnostic experiment, not
+production/paper support or Phase3B completion.

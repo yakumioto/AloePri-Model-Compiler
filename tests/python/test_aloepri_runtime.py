@@ -53,6 +53,101 @@ class RuntimeTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
+    def test_all_boundary_installer_preserves_parameters_and_actual_inventory(self):
+        model, q, keymat = runtime.load_runtime(self.balanced_artifact, self.balanced_secret)
+        native = runtime.linear_profile_summary(model)
+        self.assertEqual(native["execution_profile"], runtime.NATIVE_LINEAR_PROFILE)
+        self.assertEqual(native["installed_role_count"], 15)
+        self.assertEqual(native["wrapped_role_count"], 0)
+        parameters = dict(model.named_parameters())
+        bits = {name: value.detach().clone() for name, value in model.state_dict().items()}
+        embedding, norm, attention, activation, rotary = model.model.embed_tokens, model.model.norm, model.model.layers[0].self_attn, model.model.layers[0].mlp.act_fn, model.model.rotary_emb
+        installed = runtime.install_linear_profile(model, runtime.BALANCED_ALGORITHM, 12, linear_profile=runtime.ALL_BOUNDARY_LINEAR_PROFILE)
+        self.assertEqual(installed["wrapped_role_count"], 15)
+        self.assertEqual(len(installed["roles"]), 15)
+        self.assertTrue(all(row["implementation"] == "F64AccumLinear" for row in installed["roles"]))
+        self.assertEqual(set(model.state_dict()), set(bits))
+        for name, value in model.named_parameters():
+            self.assertIs(value, parameters[name])
+            self.assertTrue(torch.equal(value, bits[name]))
+        self.assertIs(model.model.embed_tokens, embedding)
+        self.assertIs(model.model.norm, norm)
+        self.assertIs(model.model.layers[0].self_attn, attention)
+        self.assertIs(model.model.layers[0].mlp.act_fn, activation)
+        self.assertIs(model.model.rotary_emb, rotary)
+        modules = dict(model.named_modules())
+        self.assertEqual(modules["model.layers.0.self_attn.k_proj"].out_features, 4)
+        self.assertEqual(modules["model.layers.0.self_attn.o_proj"].out_features, 12)
+        self.assertEqual(modules["model.layers.0.mlp.down_proj"].in_features, 13)
+        self.assertEqual(modules["lm_head"].out_features, 19)
+        model.load_state_dict(bits, strict=True)
+        self.assertEqual(runtime.install_linear_profile(model, runtime.BALANCED_ALGORITHM, 12, linear_profile=runtime.ALL_BOUNDARY_LINEAR_PROFILE)["wrapped_role_count"], 15)
+        report = demo.run_gates(self.baseline, model, q, keymat, self.fixture)
+        self.assertEqual([report[gate]["status"] for gate in ["G1", "G2", "G3", "G4"]], ["pass"] * 4, report)
+        costs = runtime.linear_profile_costs(model)
+        self.assertEqual(costs["executed_scope_count"], 15)
+        self.assertTrue(all(row["calls"] > 0 for row in costs["roles"]))
+        self.assertFalse(any(name.startswith("_aloepri") or name.endswith("._p") or name.endswith("._q") for name in model.state_dict()))
+        with self.assertRaises(ValueError):
+            runtime.install_linear_profile(model, runtime.BALANCED_ALGORITHM, 12, linear_profile=runtime.NATIVE_LINEAR_PROFILE)
+
+    def test_profile_rejects_unknown_legacy_partial_and_atomic_install_failures(self):
+        with self.assertRaises(ValueError):
+            runtime.load_runtime(self.balanced_artifact, self.balanced_secret, linear_profile="balanced-v2-all-boundary-f64-acc-v2")
+        with self.assertRaises(ValueError):
+            runtime.load_runtime(self.artifact, self.secret, linear_profile=runtime.ALL_BOUNDARY_LINEAR_PROFILE)
+        for kind in ["partial", "bias", "dtype", "geometry", "inventory"]:
+            model, _, _ = runtime.load_runtime(self.balanced_artifact, self.balanced_secret)
+            module = model.model.layers[0].mlp.down_proj
+            if kind == "partial":
+                model.model.layers[0].mlp.down_proj = runtime.F64AccumLinear.from_linear(module)
+            elif kind == "bias":
+                module.bias = torch.nn.Parameter(torch.zeros(12))
+            elif kind == "dtype":
+                module.weight = torch.nn.Parameter(module.weight.double())
+            elif kind == "geometry":
+                module.in_features = 99
+            else:
+                model.config.num_hidden_layers = 3
+            with self.assertRaises(ValueError):
+                runtime.install_linear_profile(model, runtime.BALANCED_ALGORITHM, 12, linear_profile=runtime.ALL_BOUNDARY_LINEAR_PROFILE)
+            self.assertIs(type(model.model.layers[0].self_attn.q_proj), torch.nn.Linear)
+        model, _, _ = runtime.load_runtime(self.balanced_artifact, self.balanced_secret)
+        with patch.object(runtime.F64AccumLinear, "from_linear", side_effect=ValueError("replacement preflight failed")):
+            with self.assertRaises(ValueError):
+                runtime.install_linear_profile(model, runtime.BALANCED_ALGORITHM, 12, linear_profile=runtime.ALL_BOUNDARY_LINEAR_PROFILE)
+        self.assertEqual(runtime.linear_profile_summary(model)["wrapped_role_count"], 0)
+        self.assertIs(type(runtime.load_runtime(self.artifact, self.secret)[0].lm_head), torch.nn.Linear)
+
+    def test_all_boundary_source_free_and_rejects_misreported_installation(self):
+        hidden = self.root / "all-boundary-unavailable-source"
+        self.source.rename(hidden)
+        try:
+            with patch.object(LlamaForCausalLM, "from_pretrained", side_effect=AssertionError("source weights forbidden")):
+                model, _, _ = runtime.load_runtime(self.balanced_artifact, self.balanced_secret, linear_profile=runtime.ALL_BOUNDARY_LINEAR_PROFILE)
+                nodes, _ = diagnostic.trace_first_block(model, [1, 4])
+                self.assertTrue(all(value.dtype == torch.float32 and value.shape[-1] == 12 for value in nodes.values()))
+                self.assertEqual(runtime.linear_profile_summary(model)["wrapped_role_count"], 15)
+            result = subprocess.run([sys.executable, str(ROOT / "demo" / "aloepri_runtime.py"), "--artifact", str(self.balanced_artifact), "--secret", str(self.balanced_secret), "--linear-profile", runtime.ALL_BOUNDARY_LINEAR_PROFILE, "--token-ids", "1", "4", "--max-new-tokens", "0"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["installed_linear_profile"]["wrapped_role_count"], 15)
+            self.assertEqual(report["linear_costs"]["executed_scope_count"], 15)
+            self.assertTrue(report["finite_logits"])
+        finally:
+            hidden.rename(self.source)
+        model, _, _ = runtime.load_runtime(self.balanced_artifact, self.balanced_secret)
+        model._aloepri_linear_profile = runtime.ALL_BOUNDARY_LINEAR_PROFILE
+        with self.assertRaises(ValueError):
+            runtime.linear_profile_summary(model)
+        model, _, _ = runtime.load_runtime(self.balanced_artifact, self.balanced_secret, linear_profile=runtime.ALL_BOUNDARY_LINEAR_PROFILE)
+        previous = model.model.layers[1].self_attn.k_proj
+        replacement = torch.nn.Linear(previous.in_features, previous.out_features, bias=False)
+        replacement.weight = previous.weight
+        model.model.layers[1].self_attn.k_proj = replacement
+        with self.assertRaises(ValueError):
+            runtime.linear_profile_summary(model)
+
     def test_actual_algorithm_commitment_and_cross_version_binding(self):
         v1, p1, q1, _ = runtime.load_keymat(self.secret)
         v2, p2, q2, _ = runtime.load_keymat(self.balanced_secret)

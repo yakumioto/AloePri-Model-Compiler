@@ -5,7 +5,8 @@ from pathlib import Path
 
 import torch
 from transformers import LlamaForCausalLM
-from aloepri_runtime import TOLERANCE, load_runtime, greedy, require
+from aloepri_runtime import (TOLERANCE, NATIVE_LINEAR_PROFILE, SUPPORTED_LINEAR_PROFILES,
+    load_runtime, greedy, require, linear_profile_summary, linear_profile_costs)
 from token_permutation_demo import load_json, load_local_llama_model, read_artifact, artifact_fingerprint
 
 
@@ -142,6 +143,7 @@ def main():
     parser.add_argument("--secret", type=Path, required=True)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--linear-profile", choices=sorted(SUPPORTED_LINEAR_PROFILES), default=NATIVE_LINEAR_PROFILE)
     args = parser.parse_args()
     torch.set_num_threads(1)
     fixture = load_json(args.fixture)
@@ -160,14 +162,23 @@ def main():
         seed = blake3.blake3(struct.pack("<Q", fixture["fixture_seed"])).hexdigest()
         require(load_json(args.secret)["master_seed"] == seed, "fixture seed mismatch")
     baseline, _ = load_local_llama_model(args.source, LlamaForCausalLM, torch)
-    runtime, q, diagnostics = load_runtime(args.artifact, args.secret)
+    runtime, q, diagnostics = load_runtime(args.artifact, args.secret, linear_profile=args.linear_profile)
+    actual_profile = linear_profile_summary(runtime)
+    require(actual_profile["execution_profile"] == args.linear_profile, "formal harness profile installation mismatch")
     report = run_gates(baseline, runtime, q, diagnostics, fixture)
     report["fixture"] = fixture
     report["source_fingerprint"] = manifest["source_fingerprint"]
     report["secret_id"] = manifest["secret_id"]
     report["physical_dimensions"] = manifest["runtime_contract"]["physical_dimensions"]
     report["construction_profile"] = binding["algorithm"]
-    report["execution_profile"] = "f32-state-native-linear-v1"
+    report["execution_profile"] = actual_profile["execution_profile"]
+    report["installed_linear_profile"] = linear_profile_summary(runtime)
+    report["linear_costs"] = linear_profile_costs(runtime)
+    report["baseline_profile"] = NATIVE_LINEAR_PROFILE
+    if report["G3"]["status"] == "fail":
+        report["G3"]["failed_checks"] = [{"prompt_index": row["prompt_index"], "check": name,
+            "path": "baseline" if name.startswith("baseline_") else ("runtime_self_consistency" if name.startswith("runtime_") else "cross_model"), **check}
+            for row in report["G3"]["prompts"] for name, check in row["checks"].items() if not check["pass"]]
     report["plan_hash"] = manifest["plan_hash"]
     report["layout_hash"] = manifest["layout_hash"]
     from keymat_numerical_diagnostics import provenance

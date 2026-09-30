@@ -129,10 +129,22 @@ F32 and reject non-finite output. A fixed 1024-output-row chunk bounds temporary
 F64 weights; no F64 parameters, persistent buffers, residuals or shadow model
 are introduced. Strict state_dict keys and physical tensor bits are preserved.
 
-Only the diagnostic first-layer down-only and gate/up/down evaluations use this
-class. All three fixed sequences must pass every original first-block node
-before considering a full-model integration. They did not pass, so the loader
-still installs ordinary F32 Linear and formal candidate G2/G3/G4 remain not_run.
+The historical v1 first-layer down-only/gate-up-down evaluations failed and
+remain isolated. Native remains the loader default. The distinct same-v2
+`balanced-v2-all-boundary-f64-acc-v1` profile is an explicit opt-in, accepted only
+for balanced-v2 artifacts: install all q/k/v/o and gate/up/down roles plus head
+(7L+1), using this same kernel and no other precision changes. Unknown, legacy,
+mixed or partially installed profiles are rejected; actual module inventory,
+geometry, CPU/F32 state and original Parameter references are checked. Same
+profile installation is idempotent after full validation, with no fallback.
+
+Installation occurs after strict weight assignment/eval and adds only ordinary
+nonpersistent metadata. The artifact/Secret/transform identity and state keys
+remain unchanged. All 211 real-model roles were installed, but only the first
+seven executed in the bounded trial: head and later-layer installation is not
+numerical evidence for those modules. Candidate prompt1/prompt2 first-FFN errors
+were 1.0797817197e-5 / 1.3192825580e-5, both above 1e-5. The necessary local gate
+failed; full candidate G2/G3/G4 remain not_run, with no additional profile search.
 This experiment adds no artifact/runtime-contract field or schema version;
 SOURCE oracle use remains isolated from transformed-only inference.
 

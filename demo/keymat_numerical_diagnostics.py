@@ -15,7 +15,9 @@ import torch.nn.functional as F
 import transformers
 from transformers import LlamaForCausalLM
 
-from aloepri_runtime import ALGORITHM, BALANCED_ALGORITHM, F64AccumLinear, load_keymat, load_runtime, require
+from aloepri_runtime import (ALGORITHM, BALANCED_ALGORITHM, F64AccumLinear, ALL_BOUNDARY_LINEAR_PROFILE,
+    NATIVE_LINEAR_PROFILE, install_linear_profile, linear_profile_summary, linear_profile_costs,
+    load_keymat, load_runtime, require)
 from hidden_expansion_demo import compare_nodes, metrics
 from token_permutation_demo import artifact_fingerprint, load_json, load_local_llama_model, read_artifact
 
@@ -383,14 +385,81 @@ def evaluate_candidates(baseline, runtime, q, fixture, failure):
             "rss_note": "process high-water includes models/oracles and is cumulative; tensor working bytes are counted separately"}
 
 
+def check_execution_profile_identity(source, artifact, secret_path, fixture_path, reference_path):
+    manifest = load_json(artifact / "aloepri.json")
+    secret = load_json(secret_path)
+    fixture = load_json(fixture_path)
+    reference = load_json(reference_path)
+    require(reference["diagnostic_only"] and reference["construction_profile"] == BALANCED_ALGORITHM and reference["execution_profile"] == NATIVE_LINEAR_PROFILE, "profile trial reference must be native balanced-v2 evidence")
+    require(reference["first_block_trial_pass"] is False and any(row["native_first_block"]["status"] == "fail" for row in reference["prompts"]), "profile trial reference is not the actual native failure")
+    require(secret["algorithm"] == BALANCED_ALGORITHM and manifest["plan"]["keymat_binding"]["algorithm"] == BALANCED_ALGORITHM, "profile trial requires balanced-v2 artifact/Secret")
+    identity = reference["identity"]
+    for field in ["source_fingerprint", "secret_id", "plan_hash", "layout_hash"]:
+        require(manifest[field] == identity[field], "profile trial changed artifact identity")
+    require(secret["secret_id"] == identity["secret_id"] and secret["source_fingerprint"] == identity["source_fingerprint"], "profile trial changed Secret identity")
+    digests = {row["name"]: row["blake3"] for row in manifest["tensors"]}
+    require(digests == identity["artifact_tensor_digests"], "profile trial changed artifact tensor digests")
+    require(blake3.blake3(fixture_path.read_bytes()).hexdigest() == identity["fixture_blake3"], "profile trial changed fixture bytes")
+    require(len(fixture["prompts"]) == len(reference["prompts"]) and [row["prompt_index"] for row in reference["prompts"]] == list(range(len(fixture["prompts"]))), "profile trial changed sequence inventory")
+    require(secret["expansion_size"] == fixture["h"] and secret["lambda_bits"] == struct.unpack("<Q", struct.pack("<d", fixture["lambda"]))[0], "profile trial changed h/lambda")
+    require(secret["master_seed"] == blake3.blake3(struct.pack("<Q", fixture["fixture_seed"])).hexdigest(), "profile trial changed generation seed")
+    config, tensors = read_artifact(source)
+    require(all(tensor[0] == "F32" for tensor in tensors.values()), "profile trial SOURCE must remain F32")
+    require(artifact_fingerprint(source, config, tensors) == identity["source_fingerprint"], "profile trial SOURCE fingerprint mismatch")
+    snapshot = dict(identity, reference_trial_blake3=blake3.blake3(reference_path.read_bytes()).hexdigest())
+    return fixture, reference, snapshot
+
+
+@torch.inference_mode()
+def evaluate_execution_profile(baseline, runtime, q, fixture, reference, *, linear_profile):
+    require(linear_profile == ALL_BOUNDARY_LINEAR_PROFILE, "profile trial allows only the fixed all-boundary candidate")
+    require(linear_profile_summary(runtime)["execution_profile"] == NATIVE_LINEAR_PROFILE, "profile trial control is not native")
+    baseline_traces = [trace_first_block(baseline, prompt + fixture["continuation_ids"]) for prompt in fixture["prompts"]]
+    expected_bits = {name: blake3.blake3(value.detach().numpy().tobytes()).hexdigest() for name, value in runtime.state_dict().items()}
+    profiles = {}
+    for profile in [NATIVE_LINEAR_PROFILE, linear_profile]:
+        started = time.perf_counter()
+        installed = install_linear_profile(runtime, BALANCED_ALGORITHM, q.shape[0], linear_profile=profile)
+        rows = []
+        for index, (prompt, (baseline_nodes, baseline_internal)) in enumerate(zip(fixture["prompts"], baseline_traces)):
+            nodes, internal = trace_first_block(runtime, prompt + fixture["continuation_ids"])
+            require(all(value.dtype == torch.float32 and value.shape[-1] == q.shape[0] for value in nodes.values()), "profile trial changed F32/D residual boundaries")
+            compared = compare_nodes(baseline_nodes, nodes, q)
+            if profile == NATIVE_LINEAR_PROFILE:
+                previous = reference["prompts"][index]["native_first_block"]
+                require([row["node"] for row in compared["nodes"]] == [row["node"] for row in previous["nodes"]], "native control trace nodes differ")
+                require(all(row["finite"] and old["finite"] and row["expanded_shape"] == old["expanded_shape"] and abs(row["max_abs"] - old["max_abs"]) <= 1e-12 for row, old in zip(compared["nodes"], previous["nodes"])), "native balanced-v2 control did not replay every original node")
+            rows.append(dict(compared, prompt_index=index, internal={name: pair_summary(baseline_internal[name], internal[name]) for name in ["gate", "up", "silu", "product", "down_input"]}))
+        unchanged = all(blake3.blake3(value.detach().numpy().tobytes()).hexdigest() == expected_bits[name] for name, value in runtime.state_dict().items())
+        require(unchanged and set(runtime.state_dict()) == set(expected_bits), "profile trial changed persistent weight bits/keys")
+        result = {"diagnostic_only": True, "execution_profile": profile, "installed_linear_profile": linear_profile_summary(runtime),
+                  "installed_scope_count": installed["installed_role_count"], "executed_scope": "layer.0 seven expanded Linear roles; no head or later-layer numerical execution",
+                  "state": state_summary(runtime, q.shape[0]), "weight_bits_unchanged": unchanged, "prompts": rows,
+                  "linear_costs": linear_profile_costs(runtime), "elapsed_seconds": time.perf_counter() - started,
+                  "process_highwater_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+        result["local_gate_pass"] = local_candidate_passes(result)
+        profiles[profile] = result
+    passed = profiles[linear_profile]["local_gate_pass"]
+    return {"diagnostic_only": True, "scope": "same balanced-v2 artifact execution-profile trial",
+            "construction_profile": BALANCED_ALGORITHM, "execution_profile": linear_profile,
+            "profiles": profiles, "native_control_replayed_all_nodes": True, "candidate_local_gate_pass": passed,
+            "decision": "eligible_for_full_model_evaluation" if passed else "stop_execution_profile_local_gate_failed",
+            "full_model_G2": "not_run", "G3": "not_run", "G4": "not_run", "default_native_profile_preserved": True,
+            "cost_note": "installed roles and executed roles differ; cumulative process RSS is not a per-profile or Compiler memory cap"}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bounded layer-0 diagnostic oracle; never a formal equivalence gate")
-    for name in ["source", "artifact", "secret", "fixture", "failure-report", "report"]:
+    for name in ["source", "artifact", "secret", "fixture", "report"]:
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--failure-report", type=Path)
     parser.add_argument("--private-error-vectors", type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--evaluate-candidate", action="store_true")
     mode.add_argument("--construction-trial", action="store_true")
+    mode.add_argument("--execution-profile-trial", action="store_true")
+    parser.add_argument("--linear-profile", choices=[NATIVE_LINEAR_PROFILE, ALL_BOUNDARY_LINEAR_PROFILE], default=NATIVE_LINEAR_PROFILE)
+    parser.add_argument("--reference-trial", type=Path)
     parser.add_argument("--diagnostic-input", type=Path)
     parser.add_argument("--control-secret", type=Path)
     parser.add_argument("--control-diagnostics", type=Path)
@@ -398,13 +467,19 @@ def main():
     torch.set_num_threads(1)
     started = time.perf_counter()
     require(not args.report.exists(), "diagnostic report already exists")
+    if args.execution_profile_trial:
+        require(args.reference_trial is not None and args.linear_profile == ALL_BOUNDARY_LINEAR_PROFILE, "execution trial requires native-v2 reference and exact all-boundary profile")
+    else:
+        require(args.failure_report is not None and args.linear_profile == NATIVE_LINEAR_PROFILE, "legacy diagnostic modes require their failure report and native profile")
     if args.evaluate_candidate:
         require(args.diagnostic_input is not None, "candidate evaluation requires prior diagnostics")
-    else:
+    elif not args.execution_profile_trial:
         require(args.private_error_vectors is not None and not args.private_error_vectors.exists(), "private error-vector output required and must not exist")
         for model_root in [args.source.resolve(), args.artifact.resolve()]:
             require(not args.private_error_vectors.resolve().is_relative_to(model_root), "private vectors must stay outside model artifacts")
-    if args.construction_trial:
+    if args.execution_profile_trial:
+        fixture, reference, snapshot = check_execution_profile_identity(args.source, args.artifact, args.secret, args.fixture, args.reference_trial)
+    elif args.construction_trial:
         require(args.control_secret is not None and args.control_diagnostics is not None, "construction trial requires original control inputs")
         fixture, failure, snapshot = check_construction_trial_identity(args.source, args.artifact, args.secret, args.fixture, args.failure_report, args.control_secret, args.control_diagnostics)
     else:
@@ -415,7 +490,9 @@ def main():
         require(all(item["native_failure_replay_delta"] <= 1e-12 for item in prior["prompts"]), "native failure was not replayed")
     baseline, _ = load_local_llama_model(args.source, LlamaForCausalLM, torch)
     runtime, q, keymat = load_runtime(args.artifact, args.secret)
-    if args.evaluate_candidate:
+    if args.execution_profile_trial:
+        report = evaluate_execution_profile(baseline, runtime, q, fixture, reference, linear_profile=args.linear_profile)
+    elif args.evaluate_candidate:
         report = evaluate_candidates(baseline, runtime, q, fixture, failure)
         report["native_diagnostic_blake3"] = blake3.blake3(args.diagnostic_input.read_bytes()).hexdigest()
     else:
@@ -431,7 +508,7 @@ def main():
                   elapsed_seconds=time.perf_counter() - started, process_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     args.report.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     print(json.dumps({"diagnostic_only": True, "scope": report["scope"], "decision": report.get("decision", "native_replay_matched")}))
-    failed = (args.evaluate_candidate and not report["candidate_local_gate_pass"]) or (args.construction_trial and not report["first_block_trial_pass"])
+    failed = ((args.evaluate_candidate or args.execution_profile_trial) and not report["candidate_local_gate_pass"]) or (args.construction_trial and not report["first_block_trial_pass"])
     raise SystemExit(1 if failed else 0)
 
 
