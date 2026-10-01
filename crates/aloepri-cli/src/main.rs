@@ -52,7 +52,16 @@ fn main() -> Result<()> {
 
 fn transform(args: args::TransformArgs) -> Result<()> {
     let method = args::resolve_method(args.identity, args.method.as_deref())?;
+    if method != MethodContract::aloepri_keymat()
+        && (args.expansion_size.is_some()
+            || args.keymat_lambda.is_some()
+            || args.keymat_fixture_seed.is_some()
+            || args.keymat_algorithm.is_some())
+    {
+        return Err(anyhow!("KeyMat parameters require --method aloepri-keymat"));
+    }
     match method {
+        method if method == MethodContract::aloepri_keymat() => transform_keymat(args),
         method if method == MethodContract::identity() => {
             if args.secret_output.is_some() {
                 return Err(anyhow!("--secret-output is only valid for aloepri-token"));
@@ -131,6 +140,126 @@ fn transform_token(args: args::TransformArgs, method: MethodContract) -> Result<
     Ok(())
 }
 
+fn transform_keymat(args: args::TransformArgs) -> Result<()> {
+    use aloepri_core::keymat::{generation_peak_bytes, lambda_bits, physical_hidden_size};
+    use aloepri_secret::keymat::{KeyMatSecretV1, material_path, reject_symlinks};
+    let secret_path = args
+        .secret_output
+        .as_deref()
+        .ok_or_else(|| anyhow!("KeyMat requires --secret-output"))?;
+    let h = args
+        .expansion_size
+        .ok_or_else(|| anyhow!("KeyMat requires --expansion-size"))?;
+    let lambda = args
+        .keymat_lambda
+        .ok_or_else(|| anyhow!("KeyMat requires --keymat-lambda"))?;
+    validate_secret_path(&args.model, &args.output, secret_path, args.resume)?;
+    validate_secret_path(
+        &args.model,
+        &args.output,
+        &material_path(secret_path),
+        args.resume,
+    )?;
+    reject_symlinks(secret_path)?;
+    reject_symlinks(&material_path(secret_path))?;
+    if secret_path == material_path(secret_path) {
+        return Err(anyhow!(
+            "Secret JSON cannot use the binary material filename"
+        ));
+    }
+    if !args.resume && (args.output.exists() || staging_path(&args.output).exists()) {
+        return Err(anyhow!("fresh KeyMat output/staging already exists"));
+    }
+    let artifact = HfArtifact::open(&args.model)?;
+    aloepri_architecture::llama::validate_keymat_source(&artifact)?;
+    let d = artifact
+        .config()
+        .get("hidden_size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("missing hidden_size"))?;
+    physical_hidden_size(d, h)?;
+    let lambda_bits = lambda_bits(lambda)?;
+    let peak = generation_peak_bytes(d, h)?;
+    if peak > args.memory_limit {
+        return Err(aloepri_core::CompilerError::MemoryLimitExceeded {
+            requested: peak,
+            available: args.memory_limit,
+        }
+        .into());
+    }
+    let source = artifact.fingerprint()?;
+    let fixture_seed = args
+        .keymat_fixture_seed
+        .map(|seed| *blake3::hash(&seed.to_le_bytes()).as_bytes());
+    let (secret, keys, b_condition) = if args.resume {
+        let (secret, keys) = KeyMatSecretV1::read(secret_path, args.memory_limit)?;
+        (secret, keys, None)
+    } else {
+        let (secret, keys, condition) = KeyMatSecretV1::generate_with_algorithm(
+            source,
+            d,
+            h,
+            lambda,
+            fixture_seed,
+            args.keymat_algorithm
+                .as_deref()
+                .unwrap_or(aloepri_core::keymat::KEYMAT_ALGORITHM),
+        )?;
+        (secret, keys, Some(condition))
+    };
+    if args
+        .keymat_algorithm
+        .as_deref()
+        .is_some_and(|algorithm| algorithm != secret.algorithm)
+    {
+        return Err(anyhow!(
+            "KeyMat algorithm flag does not match the existing Secret"
+        ));
+    }
+    let binding = secret.binding()?;
+    if binding.source_fingerprint != source
+        || binding.hidden_size != d
+        || binding.expansion_size != h
+        || binding.lambda_bits != lambda_bits
+    {
+        return Err(anyhow!("KeyMat Secret source or parameters mismatch"));
+    }
+    if let Some(seed) = fixture_seed {
+        let expected: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        if secret.master_seed != expected {
+            return Err(anyhow!("KeyMat fixture seed mismatch"));
+        }
+    }
+    let config = TransformConfig {
+        method: MethodContract::aloepri_keymat(),
+        memory_limit: ByteLength(args.memory_limit),
+        max_shard_size: ByteLength(args.max_shard_size),
+        keymat_binding: Some(binding),
+        ..TransformConfig::default()
+    };
+    let keys = std::sync::Arc::new(keys);
+    let executor = aloepri_transform::KeyMatExecutor::new(&secret, keys.clone())?;
+    let compiler = Compiler::new(HfBackend, Registry::new(), executor);
+    let plan = compiler.plan(&args.model, &config)?;
+    let diagnostics = keys.diagnostics()?;
+    if !args.resume {
+        secret.write_new(secret_path, &keys)?;
+    }
+    let report = compiler.transform(&TransformRequest {
+        input: args.model,
+        output: args.output,
+        config,
+        resume: args.resume,
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &serde_json::json!({"algorithm":secret.algorithm,"keymat":diagnostics,"b_condition_estimate":b_condition,"memory_estimate":plan.memory_estimate,"generation_peak_bytes":peak,"transform":report})
+        )?
+    );
+    Ok(())
+}
+
 fn identity_compiler() -> Compiler<HfBackend, Registry, IdentityExecutor> {
     Compiler::new(HfBackend, Registry::new(), IdentityExecutor::default())
 }
@@ -154,6 +283,7 @@ fn transform_config(
         max_shard_size: ByteLength(max_shard_size),
         workers: 1,
         secret_binding,
+        keymat_binding: None,
     };
     aloepri_secret::validate_v0_1_boundary(&config)?;
     Ok(config)

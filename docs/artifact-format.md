@@ -30,6 +30,11 @@ when present, and `aloepri.json`.
 | `TransformPlan` | 3 | source *and* output inventories, runtime contract, output-based layout |
 | `aloepri.json` manifest | 3 | embeds the non-secret plan and a layout hash |
 | `checkpoint.json` | 3 | adds the runtime contract to the resume binding |
+| KeyMat plan / manifest / checkpoint | 4 | explicit `aloepri-keymat/0.1` binding and exact_covariant runtime |
+
+KeyMat does not upgrade identity, token or diagnostic v3 artifacts. Optional
+KeyMat fields are omitted from their canonical encodings and hashes; v3 resume
+remains supported. A v4 method/version mismatch is rejected.
 
 Legacy artifacts stay readable but are never upgraded automatically:
 
@@ -66,3 +71,39 @@ None of manifest, checkpoint or plan contains the permutation, inverse
 permutation, nonce, or any key material. The Client Secret is written only to
 the caller-selected external path with exclusive creation and restrictive
 permissions.
+
+## Private KeyMat bundle v1
+
+KeyMat uses small `KeyMatSecretV1` JSON plus same-directory `key-material.bin`.
+The binary format is `keymat-f64-le-v1`: canonical row-major little-endian F64
+P followed by Q, exactly `16*d*D` bytes. Large matrices are never JSON arrays.
+The JSON binds method/source/d/h, canonical lambda bits, algorithm/RNG versions,
+master seed, nullspace cutoff and separate P/Q digests. A domain-separated
+BLAKE3 commitment binds all of these as `secret_id`; Rust and Python verify the
+same bytes, not separately regenerated approximations.
+
+Both files use exclusive creation, restrictive permissions and fsync; paths
+must be outside source/output/staging and cannot contain symlinks. Generation
+and full plan preflight precede persistence; binary is synced before JSON and
+both before model publication. This is not a cross-path atomic transaction:
+a failed write may leave private orphan material. Fresh/resume reject incomplete
+or corrupt bundles and never replace them automatically.
+
+The public v4 plan contains only the binding/parameters and linear operation
+roles. Manifest/checkpoint/shards contain no P/Q, private seed, material path or
+key tensor. Parameter/PQ identity changes affect secret_id and plan hash; resume
+also binds source, method, runtime and layout. Old v3 canonical fields/hashes
+and resume behavior remain unchanged.
+
+Algorithm identity is exact: `algorithm1-v1` retains unit-standard-deviation
+C/N coefficients; `algorithm1-balanced-null-v2` uses d^-1/2 for those coefficients
+only, with the same raw RNG substreams and bases. Existing JSON fields and binary
+format/schema are unchanged. Commitment and binding use the **actual** allowed
+algorithm string in both Rust and Python; changing only that string while keeping
+old digests/commitment is invalid. Never reinterpret or overwrite old material.
+
+Fresh CLI calls still default to v1; v2 requires explicit `--keymat-algorithm`.
+Resume without the flag uses its stored Secret's algorithm, while an explicit
+mismatch is rejected before staging/lock/writer. Interrupted and published
+v1↔v2 resumes are refused even when output layout hashes are equal: Secret/PQ/
+algorithm and plan identities, not layout inequality, distinguish the artifacts.
