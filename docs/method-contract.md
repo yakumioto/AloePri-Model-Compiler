@@ -154,6 +154,37 @@ Maxima of separate components are not additive contributions or lower bounds.
 Higher arithmetic precision is not automatically equivalence to the original
 F32 baseline; neither unchanged encoding nor improved local errors satisfy AC10.
 
+### Bounded floating semantics audit (references are not profiles)
+
+`keymat_float_semantics_audit.py` fixes four layer0 paths: A is the only native
+F32 SOURCE acceptance target; B keeps its F32 boundaries and changes seven
+logical Linear arithmetic calls to temporary F64; C is the actual failed
+same-v2 all-boundary runtime; D keeps C's artifact embedding/keys/norm and F32
+boundaries but uses seven private ideal F64 coefficients derived from SOURCE.
+B/D are independent first-block references using the pinned Llama forward
+prefix, not supported execution profiles or legal artifacts. They have no
+normal profile metadata, head/logits/generation path or full-model FP64 shadow.
+Normal A/C objects, modules, Parameters, state and buffers are checked unchanged.
+
+At every required node, separately recover C/D as double@Q, then reconstruct
+C-A=(B-A)+(D-B)+(C-D) in F64. The audit reports maxima/means/L2/signed means and
+all three signed terms at the *actual C* worst coordinate. Independent maxima
+are never additive causes or lower bounds. Projection diagnostics are compared
+directly, without Q. Private error vectors stay outside models in exclusive0600
+files, not public reports.
+
+Actual vector reconstruction error was0. Ideal D still differs from A beyond
+1e-5 at prompt1/2 FFN/block, while B itself crosses1e-5 at prompt1 block and
+prompt2 FFN/block. At prompt2 C's worst FFN coordinate, signed terms were about
+-5.72205e-6, -7.41227e-6 and -5.85119e-8. Removing Linear weight encoding alone
+therefore does not explain away the observed failure; native-arithmetic
+fidelity and expanded coordinate/boundary propagation need future evidence.
+No compensation/profile/family/baseline change is implemented by this audit.
+
+Audit exit0 means checks completed only: audit_completed/diagnostic_only=true,
+ac10_satisfied=false and formalG2/G3/G4=not_run. Reference comparisons within a
+threshold are not AC10 evidence; A remains the original native F32 target.
+
 ## Verification layering
 
 Structural verification and model semantic verification are separate:

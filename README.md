@@ -313,3 +313,52 @@ all211 installed roles, F32/D640 first-block outputs and first-layer projection
 cache [1,3,4,64], without SOURCE or Llama.from_pretrained. It did not execute
 head/later layers or generation. This remains a diagnostic experiment, not
 production/paper support or Phase3B completion.
+
+### Bounded floating semantics audit — evidence only
+
+No new repair profile is selected. `demo/keymat_float_semantics_audit.py` runs
+only the fixed three `prompt+continuation` layer0 prefixes and preserves normal
+runtime/installer/harness/Compiler/Secret/fixture behavior:
+
+- A: original native CPU/F32 SOURCE, always the only acceptance target.
+- B: independent SOURCE first-block copy, seven temporary-F64 Linear calls,
+  with original F32 embedding/norm/attention/nonlinearity/residual boundaries.
+- C: actual same-v2 all-boundary runtime, strictly replayed from latest evidence.
+- D: independent first-block reference with the same actual artifact embedding,
+  keys/norm/config/F32 boundaries as C; seven ideal private F64 coefficients
+  from SOURCE/P/Q. D is SOURCE-dependent and not a legal F32 artifact/profile.
+
+The references reuse the pinned HF Llama prefix/DecoderLayer/MLP forward and
+stop after layer0. Only two first-block copies and seven ideal matrices exist;
+no whole-model double shadow is created. B/D cannot be formal baselines or
+normal profile models. Original A/C state, Parameter/module/buffer identities
+are checked before/after reference execution; their weights are not replaced.
+
+```bash
+mkdir PRIVATE_AUDIT_DIR
+HF_HUB_OFFLINE=1 python demo/keymat_float_semantics_audit.py \
+  --source SOURCE_F32 --artifact EXISTING_V2_ARTIFACT \
+  --secret EXISTING_V2_PRIVATE/secret.json \
+  --fixture demo/hidden_expansion_fixture.json \
+  --reference-profile profile-first-block.json \
+  --private-error-vectors PRIVATE_AUDIT_DIR/errors.pt \
+  --report float-semantics-audit.json
+```
+
+Each D/C residual is separately recovered by double@Q before subtraction.
+Elementwise C-A=(B-A)+(D-B)+(C-D) reconstruction was0; signed terms are reported
+at C's actual worst coordinate, not by adding unrelated scalar maxima.
+Prompt1 C's worst FFN coordinate [0,1,308] decomposed into about
++9.53674e-6 +7.63195e-7 +4.97879e-7 = +1.07978e-5.
+Prompt2 [0,0,247] decomposed into
+-5.72205e-6 -7.41227e-6 -5.85119e-8 = -1.31928e-5.
+Ideal D still exceeded1e-5 against A for both failing prompts; logical B itself
+also exceeded1e-5 at prompt1 block and prompt2 FFN/block. Thus more accurate
+coefficients alone are not a verified repair, and more accurate real arithmetic
+is not automatically fidelity to the original native F32 execution.
+
+Exit0 reports audit_completed=true/diagnostic_only=true/ac10_satisfied=false;
+formal G2/G3/G4 remain not_run. The 0600/exclusive private vectors and ideal
+coefficients are not uploaded. This audit ends at supported/unknown evidence
+for a future plan: no baseline/threshold/dtype/profile/keys/compensation change,
+no head/logits/cache/generation, and no claim that every F32 strategy is impossible.
