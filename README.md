@@ -362,3 +362,35 @@ formal G2/G3/G4 remain not_run. The 0600/exclusive private vectors and ideal
 coefficients are not uploaded. This audit ends at supported/unknown evidence
 for a future plan: no baseline/threshold/dtype/profile/keys/compensation change,
 no head/logits/cache/generation, and no claim that every F32 strategy is impossible.
+
+### Native-input FFN-only necessary precheck — no new supported profile
+
+The one fixed precheck keeps the same v2 native Attention prefix and uses its
+actual D/F32 z_norm and post-attention residual z1. Original MLP recomputation
+and F32 residual addition bitmatch the native trace. A separate clone of the
+actual artifact MLP (F32 parameters/activation) wraps only gate/up/down with the
+existing temporary-F64 arithmetic. It does not read SOURCE weights or baseline
+hidden states as candidate data, nor install wrappers in the actual model.
+The diagnostic candidate computes ffn_D32=cloned_mlp(z_norm_D32) and
+block_D32=z1_D32+ffn_D32. All eight original required nodes/three full fixed
+sequences use the original A/Q comparison; first-six prefix nodes are unchanged.
+
+```bash
+HF_HUB_OFFLINE=1 python demo/keymat_ffn_same_input_trial.py \
+  --source SOURCE_F32 --artifact EXISTING_V2_ARTIFACT \
+  --secret EXISTING_V2_PRIVATE/secret.json --fixture demo/hidden_expansion_fixture.json \
+  --reference-audit float-semantics-audit.json --report ffn-same-input-trial.json
+```
+
+Original models, Parameter/state/buffer/profile metadata and cloned weight bits
+were unchanged. Every original MLP/recomputed residual matched native trace
+bits. Prompt0/prompt1 candidate block max errors were7.1053110062e-6 and
+8.4815633912e-6; prompt2 still failed FFN/block at1.1115812466e-5 /
+1.2282493927e-5, both at [0,0,247]. The fixed precheck exited1 and stopped.
+Thus the proposed `balanced-v2-native-attn-head-f64-ffn-v1` was **not** added to
+SUPPORTED_LINEAR_PROFILES/normal loader, no per-role production implementation
+or full-model G2/G3/G4 was run, and no further scope/chunk/keys/dtype/baseline
+search was attempted. The precheck is diagnostic_only, not a SOURCE-dependent
+runtime or a formal equivalence claim. Temporary FFN F64 peak was8073216 bytes
+(working8134656); process RSS includes both models/oracles/allocator and is not
+the Compiler memory-limit. Phase3B remains incomplete.

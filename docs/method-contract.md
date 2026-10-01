@@ -185,6 +185,24 @@ Audit exit0 means checks completed only: audit_completed/diagnostic_only=true,
 ac10_satisfied=false and formalG2/G3/G4=not_run. Reference comparisons within a
 threshold are not AC10 evidence; A remains the original native F32 target.
 
+### Same-native-input actual-artifact FFN precheck
+
+`keymat_ffn_same_input_trial.py` freezes native-v2 Attention/head behavior and
+captures its actual D-dimensional F32 post-attention residual z1 and post-norm
+input z_norm. Recalling the original MLP(z_norm) and z1+MLP(z_norm) must bitmatch
+the native trace before a candidate is evaluated. Only a separate copy of that
+actual artifact MLP uses F64AccumLinear for gate/up/down; coefficients remain
+F32 actual weights, not SOURCE/theoretical references. Candidate block output
+is exactly the F32 addition z1+candidate_ffn32. The first six required nodes
+stay the actual native trace, with every sequence/node compared to unchanged A.
+
+The necessary precheck failed prompt2: FFN max1.1115812466e-5, block
+max1.2282493927e-5 at [0,0,247]. Other two sequences passed locally, but that
+cannot satisfy the all-sequence gate. No `balanced-v2-native-attn-head-f64-ffn-v1`
+production profile was added, no per-role guard weakened, and full formal
+G2/G3/G4 remain not_run. Original models/state/Parameters/buffers/profile are
+unchanged; no encoding/keys/chunk/scope/baseline search followed the failure.
+
 ## Verification layering
 
 Structural verification and model semantic verification are separate:
