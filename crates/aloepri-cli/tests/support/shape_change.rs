@@ -245,7 +245,9 @@ impl ArchitectureAdapter for ShapeTestAdapter {
                     }
                 }
                 OperationKind::Copy => tensor.into(),
-                OperationKind::TokenPermutation { .. } => {
+                OperationKind::TokenPermutation { .. }
+                | OperationKind::KeyMatRight { .. }
+                | OperationKind::KeyMatLeft { .. } => {
                     unreachable!("the diagnostic adapter never plans a token permutation")
                 }
             };
@@ -272,6 +274,8 @@ impl ArchitectureAdapter for ShapeTestAdapter {
             logical_dimensions,
             physical_dimensions,
             expansion_size: Some(expansion),
+            norm_mode: None,
+            kv_cache_format: None,
         };
         match self.tamper {
             Tamper::None => {}
@@ -362,7 +366,9 @@ impl TransformExecutor for PadColumnsExecutor {
                 copy_bytes(&mut reader, &mut write, output.byte_length, budget)?;
                 Ok(())
             }
-            OperationKind::TokenPermutation { .. } => Err(CompilerError::Unsupported(
+            OperationKind::TokenPermutation { .. }
+            | OperationKind::KeyMatRight { .. }
+            | OperationKind::KeyMatLeft { .. } => Err(CompilerError::Unsupported(
                 "the diagnostic executor does not implement token permutation".into(),
             )),
         }

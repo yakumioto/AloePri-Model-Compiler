@@ -1,0 +1,10 @@
+{
+  "model_revision": "93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+  "h": 32,
+  "lambda": 0.3,
+  "fixture_seed": 20260930,
+  "texts": ["Once upon a time", "The capital of France is", "Explain why one plus one equals two."],
+  "prompts": [[6403, 1980, 253, 655], [504, 3575, 282, 4649, 314], [36971, 1701, 582, 8055, 582, 16473, 827, 30]],
+  "continuation_ids": [100, 200, 300, 400],
+  "max_new_tokens": 8
+}

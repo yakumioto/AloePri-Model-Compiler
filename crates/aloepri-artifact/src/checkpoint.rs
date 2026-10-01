@@ -70,7 +70,10 @@ impl Checkpoint {
         })?;
         let checkpoint: Self =
             serde_json::from_slice(&bytes).map_err(|source| json_error(path, source))?;
-        if checkpoint.schema_version != SCHEMA_VERSION {
+        if !matches!(
+            checkpoint.schema_version,
+            SCHEMA_VERSION | aloepri_core::keymat::KEYMAT_SCHEMA_VERSION
+        ) {
             return Err(CompilerError::UnsupportedVersion {
                 version: checkpoint.schema_version,
             });

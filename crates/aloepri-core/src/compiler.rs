@@ -59,6 +59,14 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
         validate_output_path(artifact.root(), &request.output)?;
         let plan = self.build_plan(artifact.as_ref(), &request.config)?;
         self.executor.requirements(&request.config)?;
+        let budget = MemoryBudget::new(request.config.memory_limit.0);
+        let _resident = if plan.method == crate::MethodContract::aloepri_keymat() {
+            Some(budget.reserve(
+                plan.memory_estimate.metadata_bytes.0 + plan.memory_estimate.method_state_bytes.0,
+            )?)
+        } else {
+            None
+        };
 
         let output = request.output.as_path();
         let parent = output
@@ -140,7 +148,6 @@ impl<B: ArtifactBackend, R: ArchitectureRegistry, E: TransformExecutor> Compiler
             }
         };
 
-        let budget = MemoryBudget::new(request.config.memory_limit.0);
         for operation in &plan.operations {
             if completed.contains_key(&operation.id) {
                 continue;

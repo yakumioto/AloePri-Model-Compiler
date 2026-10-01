@@ -92,7 +92,9 @@ impl TransformExecutor for TokenPermutationExecutor {
             OperationKind::TokenPermutation { role } => {
                 self.execute_permutation(artifact, operation, role, sink, budget)
             }
-            OperationKind::PadColumns { .. } => Err(CompilerError::Unsupported(
+            OperationKind::PadColumns { .. }
+            | OperationKind::KeyMatRight { .. }
+            | OperationKind::KeyMatLeft { .. } => Err(CompilerError::Unsupported(
                 "aloepri-token does not implement column padding".into(),
             )),
         }

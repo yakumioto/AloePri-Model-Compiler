@@ -3,6 +3,7 @@ pub mod compiler;
 pub mod error;
 pub mod executor;
 pub mod io;
+pub mod keymat;
 pub mod memory;
 pub mod model;
 pub mod plan;
