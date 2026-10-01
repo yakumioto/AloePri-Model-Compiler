@@ -54,7 +54,7 @@ pub struct TransformArgs {
         help = "Deterministic fixture seed; never use for private production keys"
     )]
     pub keymat_fixture_seed: Option<u64>,
-    #[arg(long, value_parser = ["algorithm1-v1", "algorithm1-balanced-null-v2"])]
+    #[arg(long, value_parser = ["algorithm1-v1", "algorithm1-balanced-null-v2", "algorithm1-signed-null-v3"])]
     pub keymat_algorithm: Option<String>,
     #[arg(long, default_value = "256MiB", value_parser = parse_size)]
     pub memory_limit: u64,

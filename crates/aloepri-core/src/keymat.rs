@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 pub const KEYMAT_SCHEMA_VERSION: u32 = 4;
 pub const KEYMAT_ALGORITHM: &str = "algorithm1-v1";
 pub const KEYMAT_BALANCED_ALGORITHM: &str = "algorithm1-balanced-null-v2";
+pub const KEYMAT_SIGNED_ALGORITHM: &str = "algorithm1-signed-null-v3";
 
 pub fn validate_algorithm(algorithm: &str) -> Result<()> {
     match algorithm {
-        KEYMAT_ALGORITHM | KEYMAT_BALANCED_ALGORITHM => Ok(()),
+        KEYMAT_ALGORITHM | KEYMAT_BALANCED_ALGORITHM | KEYMAT_SIGNED_ALGORITHM => Ok(()),
         _ => Err(CompilerError::Unsupported(format!(
             "unsupported KeyMat algorithm {algorithm}"
         ))),

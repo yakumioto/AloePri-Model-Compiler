@@ -11,11 +11,13 @@ from safetensors import safe_open
 from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 from token_permutation_demo import load_json, load_local_llama_config
+from signed_null_linear import signed_null_support, SignedColumnBlockedLinear, SignedRowBlockedLinear
 
 METHOD = {"id": "aloepri-keymat", "version": "0.1"}
 ALGORITHM = "algorithm1-v1"
 BALANCED_ALGORITHM = "algorithm1-balanced-null-v2"
-SUPPORTED_ALGORITHMS = {ALGORITHM, BALANCED_ALGORITHM}
+SIGNED_ALGORITHM = "algorithm1-signed-null-v3"
+SUPPORTED_ALGORITHMS = {ALGORITHM, BALANCED_ALGORITHM, SIGNED_ALGORITHM}
 RNG = "chacha20-rand0.9-normal0.5-v1"
 TOLERANCE = 1e-5
 
@@ -146,7 +148,8 @@ def tensor_specs(config, big_d):
 F64_LINEAR_ROW_CHUNK = 1024
 NATIVE_LINEAR_PROFILE = "f32-state-native-linear-v1"
 ALL_BOUNDARY_LINEAR_PROFILE = "balanced-v2-all-boundary-f64-acc-v1"
-SUPPORTED_LINEAR_PROFILES = {NATIVE_LINEAR_PROFILE, ALL_BOUNDARY_LINEAR_PROFILE}
+SIGNED_LINEAR_PROFILE = "signed-null-f32-blocked-v1"
+SUPPORTED_LINEAR_PROFILES = {NATIVE_LINEAR_PROFILE, ALL_BOUNDARY_LINEAR_PROFILE, SIGNED_LINEAR_PROFILE}
 
 
 class F64AccumLinear(torch.nn.Linear):
@@ -214,10 +217,17 @@ def _linear_targets(model, big_d):
     return targets
 
 
-def _validate_linear_targets(targets, implementation):
+def _profile_implementation(profile, member):
+    if profile == NATIVE_LINEAR_PROFILE: return torch.nn.Linear
+    if profile == ALL_BOUNDARY_LINEAR_PROFILE: return F64AccumLinear
+    require(profile == SIGNED_LINEAR_PROFILE, "unknown role profile")
+    return SignedRowBlockedLinear if member in ["o_proj", "down_proj"] else SignedColumnBlockedLinear
+
+
+def _validate_linear_targets(targets, profile):
     for name, parent, member, in_features, out_features in targets:
         module = getattr(parent, member)
-        require(type(module) is implementation, f"mixed/partial Linear profile at {name}")
+        require(type(module) is _profile_implementation(profile, member), f"mixed/partial Linear profile at {name}")
         require(module.bias is None and module.weight.dtype == torch.float32 and module.weight.device.type == "cpu", f"profile requires CPU/F32/no-bias at {name}")
         require(module.in_features == in_features and module.out_features == out_features and tuple(module.weight.shape) == (out_features, in_features), f"profile geometry mismatch at {name}")
 
@@ -229,8 +239,14 @@ def linear_profile_summary(model):
     if profile == ALL_BOUNDARY_LINEAR_PROFILE:
         require(model._aloepri_construction_algorithm == BALANCED_ALGORITHM, "all-boundary profile requires balanced-v2")
     targets = _linear_targets(model, model._aloepri_physical_hidden_size)
-    implementation = F64AccumLinear if profile == ALL_BOUNDARY_LINEAR_PROFILE else torch.nn.Linear
-    _validate_linear_targets(targets, implementation)
+    _validate_linear_targets(targets, profile)
+    if profile == SIGNED_LINEAR_PROFILE:
+        require(model._aloepri_construction_algorithm == SIGNED_ALGORITHM, "signed-null profile requires v3")
+        active, _ = signed_null_support(model.model.norm._p, model.model.norm._q)
+        for _, parent, member, _, _ in targets:
+            module = getattr(parent, member)
+            require(module.d == model.config.hidden_size and torch.equal(module._active_p, active), "signed-null role support mismatch")
+    _validate_linear_targets(targets, profile)
     require(all(getattr(parent, member).weight is original for (_, parent, member, _, _), original in zip(targets, model._aloepri_linear_parameters)), "profile changed Parameter objects")
     require(len(model._aloepri_linear_parameters) == len(targets), "profile Parameter inventory mismatch")
     require(all(value.dtype == torch.float32 and value.device.type == "cpu" for value in model.parameters()), "non-F32/CPU model parameters")
@@ -240,7 +256,7 @@ def linear_profile_summary(model):
               "implementation": type(getattr(parent, member)).__name__, "parameter_dtype": "torch.float32"}
              for name, parent, member, width, height in targets]
     return {"execution_profile": profile, "construction_profile": model._aloepri_construction_algorithm,
-            "installed_role_count": len(roles), "wrapped_role_count": len(roles) if implementation is F64AccumLinear else 0,
+            "installed_role_count": len(roles), "wrapped_role_count": len(roles) if profile != NATIVE_LINEAR_PROFILE else 0,
             "parameter_objects_preserved": True, "parameters_and_state_f32": True, "physical_head_independent": True,
             "physical_hidden_size": model._aloepri_physical_hidden_size, "roles": roles}
 
@@ -250,19 +266,27 @@ def install_linear_profile(model, algorithm, big_d, *, linear_profile=NATIVE_LIN
     require(algorithm in SUPPORTED_ALGORITHMS, "unknown profile construction algorithm")
     if linear_profile == ALL_BOUNDARY_LINEAR_PROFILE:
         require(algorithm == BALANCED_ALGORITHM, "all-boundary profile requires balanced-v2 artifact")
+    if linear_profile == SIGNED_LINEAR_PROFILE:
+        require(algorithm == SIGNED_ALGORITHM, "signed-null profile requires v3 construction")
     targets = _linear_targets(model, big_d)
     if hasattr(model, "_aloepri_linear_profile"):
         current = linear_profile_summary(model)
         require(current["construction_profile"] == algorithm and current["physical_hidden_size"] == big_d, "profile identity metadata mismatch")
         if current["execution_profile"] == linear_profile:
             return current
-        require(current["execution_profile"] == NATIVE_LINEAR_PROFILE and linear_profile == ALL_BOUNDARY_LINEAR_PROFILE, "profile cannot silently switch/fallback")
-    _validate_linear_targets(targets, torch.nn.Linear)
+        require(current["execution_profile"] == NATIVE_LINEAR_PROFILE and linear_profile != NATIVE_LINEAR_PROFILE, "profile cannot silently switch/fallback")
+    _validate_linear_targets(targets, NATIVE_LINEAR_PROFILE)
     originals = tuple(getattr(parent, member).weight for _, parent, member, _, _ in targets)
     state_keys = tuple(model.state_dict())
-    replacements = [(parent, member, F64AccumLinear.from_linear(getattr(parent, member)))
-                    for _, parent, member, _, _ in targets] if linear_profile == ALL_BOUNDARY_LINEAR_PROFILE else []
+    if linear_profile == SIGNED_LINEAR_PROFILE:
+        active, _ = signed_null_support(model.model.norm._p, model.model.norm._q)
+        replacements = [(parent, member, _profile_implementation(linear_profile, member)(getattr(parent, member).weight, model.config.hidden_size, active))
+                        for _, parent, member, _, _ in targets]
+    else:
+        replacements = [(parent, member, F64AccumLinear.from_linear(getattr(parent, member)))
+                        for _, parent, member, _, _ in targets] if linear_profile == ALL_BOUNDARY_LINEAR_PROFILE else []
     for parent, member, replacement in replacements:
+        replacement.train(getattr(parent, member).training)
         setattr(parent, member, replacement)
     model._aloepri_linear_profile = linear_profile
     model._aloepri_construction_algorithm = algorithm
@@ -281,7 +305,12 @@ def linear_profile_costs(model):
             costs.append({"name": name, "calls": module.calls, "elapsed_seconds": module.elapsed_seconds,
                           "peak_f64_temporary_bytes": module.peak_f64_temporary_bytes,
                           "peak_working_bytes": module.peak_working_bytes, "output_row_chunk": F64_LINEAR_ROW_CHUNK})
-    largest = max(costs, key=lambda row: row["peak_f64_temporary_bytes"], default=None)
+        elif type(module) in [SignedColumnBlockedLinear, SignedRowBlockedLinear]:
+            require(module.core_calls == module.aux_calls, "signed-null skipped auxiliary GEMM")
+            costs.append({"name": name, "calls": module.core_calls, "core_gemm_calls": module.core_calls, "aux_gemm_calls": module.aux_calls,
+                          "elapsed_seconds": module.elapsed_seconds, "peak_f64_temporary_bytes": 0, "peak_working_bytes": module.peak_f32_temporary_weight_bytes,
+                          "peak_f32_core_weight_copy_bytes": module.peak_f32_temporary_weight_bytes, "physical_tile_not_logical_decode": True})
+    largest = max(costs, key=lambda row: row["peak_working_bytes"], default=None)
     return {"execution_profile": installed["execution_profile"], "installed_scope_count": installed["installed_role_count"],
             "executed_scope_count": sum(row["calls"] > 0 for row in costs), "executed_roles": [row["name"] for row in costs if row["calls"]],
             "max_temporary_module": largest["name"] if largest else None,

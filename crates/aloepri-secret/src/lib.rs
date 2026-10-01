@@ -1,4 +1,5 @@
 pub mod keymat;
+mod signed_null;
 
 use aloepri_core::{
     error::{CompilerError, Result, io_error, json_error},

@@ -149,9 +149,13 @@ fn explicit_algorithms_preserve_default_and_resume_the_actual_secret() {
     let input = dir.path().join("source");
     source(&input, true, false, "F32");
     let mut manifests = Vec::new();
-    for (index, algorithm) in ["algorithm1-v1", "algorithm1-balanced-null-v2"]
-        .iter()
-        .enumerate()
+    for (index, algorithm) in [
+        "algorithm1-v1",
+        "algorithm1-balanced-null-v2",
+        "algorithm1-signed-null-v3",
+    ]
+    .iter()
+    .enumerate()
     {
         let private = dir.path().join(format!("private-{index}"));
         fs::create_dir(&private).unwrap();
@@ -223,10 +227,16 @@ fn explicit_algorithms_preserve_default_and_resume_the_actual_secret() {
 
 #[test]
 fn algorithm_cross_resume_is_rejected_before_staging_or_lock_changes() {
-    use aloepri_core::keymat::{KEYMAT_ALGORITHM, KEYMAT_BALANCED_ALGORITHM};
+    use aloepri_core::keymat::{
+        KEYMAT_ALGORITHM, KEYMAT_BALANCED_ALGORITHM, KEYMAT_SIGNED_ALGORITHM,
+    };
     for (original_algorithm, other_algorithm) in [
         (KEYMAT_ALGORITHM, KEYMAT_BALANCED_ALGORITHM),
         (KEYMAT_BALANCED_ALGORITHM, KEYMAT_ALGORITHM),
+        (KEYMAT_ALGORITHM, KEYMAT_SIGNED_ALGORITHM),
+        (KEYMAT_SIGNED_ALGORITHM, KEYMAT_ALGORITHM),
+        (KEYMAT_BALANCED_ALGORITHM, KEYMAT_SIGNED_ALGORITHM),
+        (KEYMAT_SIGNED_ALGORITHM, KEYMAT_BALANCED_ALGORITHM),
     ] {
         let dir = tempdir().unwrap();
         let input = dir.path().join("source");

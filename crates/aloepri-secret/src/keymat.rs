@@ -5,8 +5,8 @@ use aloepri_core::{
     CompilerError, MethodContract, ModelFingerprint, Result,
     error::{io_error, json_error},
     keymat::{
-        KEYMAT_ALGORITHM, KEYMAT_BALANCED_ALGORITHM, KEYMAT_RNG, KEYMAT_TOLERANCE, KeyMatBinding,
-        lambda_bits, physical_hidden_size, validate_algorithm,
+        KEYMAT_ALGORITHM, KEYMAT_BALANCED_ALGORITHM, KEYMAT_RNG, KEYMAT_SIGNED_ALGORITHM,
+        KEYMAT_TOLERANCE, KeyMatBinding, lambda_bits, physical_hidden_size, validate_algorithm,
     },
 };
 use nalgebra::{DMatrix, linalg::SVD};
@@ -474,6 +474,17 @@ fn generate(
     seed: &[u8; 32],
     algorithm: &str,
 ) -> Result<(KeyMaterial, f64)> {
+    if algorithm == KEYMAT_SIGNED_ALGORITHM {
+        let (p, q) = crate::signed_null::material(d, h, lambda, seed);
+        let keys = KeyMaterial {
+            d,
+            big_d: d + 2 * h,
+            p,
+            q,
+        };
+        keys.validate()?;
+        return Ok((keys, 1.0));
+    }
     let scale = 1.0 / (d as f64).sqrt();
     let null_scale = match algorithm {
         KEYMAT_ALGORITHM => 1.0,
@@ -554,6 +565,65 @@ mod tests {
             assert!(pq.p.iter().any(|v| v.abs() > 0.1));
         }
     }
+    #[test]
+    fn signed_null_version_identity_and_exact_support_are_deterministic() {
+        for (d, h, lambda) in [(1, 2, 0.0), (4, 8, 0.3), (8, 2, 0.3)] {
+            let (secret, keys, condition) = KeyMatSecretV1::generate_with_algorithm(
+                source(),
+                d,
+                h,
+                lambda,
+                Some([7; 32]),
+                KEYMAT_SIGNED_ALGORITHM,
+            )
+            .unwrap();
+            let (again, repeated, _) = KeyMatSecretV1::generate_with_algorithm(
+                source(),
+                d,
+                h,
+                lambda,
+                Some([7; 32]),
+                KEYMAT_SIGNED_ALGORITHM,
+            )
+            .unwrap();
+            assert_eq!(secret.secret_id, again.secret_id);
+            assert_eq!(keys.p, repeated.p);
+            assert_eq!(keys.q, repeated.q);
+            assert_eq!(condition, 1.0);
+            assert_eq!(keys.diagnostics().unwrap().max_abs_pq_error, 0.0);
+            assert_eq!(keys.p[0], -1.0);
+            for column in keys.d..keys.big_d {
+                let p_active = (0..keys.d).any(|row| keys.p[row * keys.big_d + column] != 0.0);
+                let q_active = (0..keys.d).any(|row| keys.q[column * keys.d + row] != 0.0);
+                assert_ne!(p_active, q_active);
+            }
+            let mut tampered = secret.clone();
+            tampered.algorithm = KEYMAT_ALGORITHM.into();
+            assert!(tampered.validate().is_err());
+            let (changed, _, _) = KeyMatSecretV1::generate_with_algorithm(
+                source(),
+                d,
+                h,
+                lambda + 0.1,
+                Some([7; 32]),
+                KEYMAT_SIGNED_ALGORITHM,
+            )
+            .unwrap();
+            assert_ne!(secret.secret_id, changed.secret_id);
+            assert_ne!(secret.p_digest, changed.p_digest);
+            let (v2, _, _) = KeyMatSecretV1::generate_with_algorithm(
+                source(),
+                d,
+                h,
+                lambda,
+                Some([7; 32]),
+                KEYMAT_BALANCED_ALGORITHM,
+            )
+            .unwrap();
+            assert_ne!(secret.secret_id, v2.secret_id);
+        }
+    }
+
     #[test]
     fn v1_golden_and_versioned_identity_remain_stable() {
         let source = ModelFingerprint::from_hex(
